@@ -191,13 +191,13 @@ func (b *InMemoryBroker) Queues(ctx context.Context) ([]QueueInfo, error) {
 	return qi, nil
 }
 
-func (b *InMemoryBroker) PublishHeartbeat(_ context.Context, n tork.Node) error {
-	return b.publish(QUEUE_HEARBEAT, n)
+func (b *InMemoryBroker) PublishHeartbeat(_ context.Context, n *tork.Node) error {
+	return b.publish(QUEUE_HEARBEAT, n.Clone())
 }
 
-func (b *InMemoryBroker) SubscribeForHeartbeats(handler func(n tork.Node) error) error {
+func (b *InMemoryBroker) SubscribeForHeartbeats(handler func(n *tork.Node) error) error {
 	return b.subscribe(QUEUE_HEARBEAT, func(m any) error {
-		n, ok := m.(tork.Node)
+		n, ok := m.(*tork.Node)
 		if !ok {
 			return errors.New("can't cast to node")
 		}
@@ -269,5 +269,12 @@ func (b *InMemoryBroker) PublishEvent(ctx context.Context, topicName string, eve
 			topic.publish(event)
 		}
 	})
+	return nil
+}
+
+func (b *InMemoryBroker) HealthCheck(ctx context.Context) error {
+	if b.terminate.Load() {
+		return errors.New("broker is terminated")
+	}
 	return nil
 }

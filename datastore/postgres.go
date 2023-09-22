@@ -36,13 +36,14 @@ type taskRecord struct {
 	Entrypoint  pq.StringArray `db:"entrypoint"`
 	Run         string         `db:"run_script"`
 	Image       string         `db:"image"`
+	Registry    []byte         `db:"registry"`
 	Env         []byte         `db:"env"`
 	Files       []byte         `db:"files_"`
 	Queue       string         `db:"queue"`
 	Error       string         `db:"error_"`
 	Pre         []byte         `db:"pre_tasks"`
 	Post        []byte         `db:"post_tasks"`
-	Volumes     pq.StringArray `db:"volumes"`
+	Mounts      []byte         `db:"mounts"`
 	Networks    pq.StringArray `db:"networks"`
 	NodeID      string         `db:"node_id"`
 	Retry       []byte         `db:"retry"`
@@ -76,6 +77,7 @@ type jobRecord struct {
 	Result      string     `db:"result"`
 	Error       string     `db:"error_"`
 	TS          string     `db:"ts"`
+	Defaults    []byte     `db:"defaults"`
 }
 
 type nodeRecord struct {
@@ -131,7 +133,8 @@ func (r taskRecord) toTask() (*tork.Task, error) {
 	}
 	var parallel *tork.ParallelTask
 	if r.Parallel != nil {
-		if err := json.Unmarshal(r.Parallel, &parallel); err != nil {
+		parallel = &tork.ParallelTask{}
+		if err := json.Unmarshal(r.Parallel, parallel); err != nil {
 			return nil, errors.Wrapf(err, "error deserializing task.parallel")
 		}
 	}
@@ -149,7 +152,19 @@ func (r taskRecord) toTask() (*tork.Task, error) {
 			return nil, errors.Wrapf(err, "error deserializing task.subjob")
 		}
 	}
-
+	var registry *tork.Registry
+	if r.Registry != nil {
+		registry = &tork.Registry{}
+		if err := json.Unmarshal(r.Registry, registry); err != nil {
+			return nil, errors.Wrapf(err, "error deserializing task.registry")
+		}
+	}
+	var mounts []tork.Mount
+	if r.Mounts != nil {
+		if err := json.Unmarshal(r.Mounts, &mounts); err != nil {
+			return nil, errors.Wrapf(err, "error deserializing task.registry")
+		}
+	}
 	return &tork.Task{
 		ID:          r.ID,
 		JobID:       r.JobID,
@@ -165,13 +180,14 @@ func (r taskRecord) toTask() (*tork.Task, error) {
 		Entrypoint:  r.Entrypoint,
 		Run:         r.Run,
 		Image:       r.Image,
+		Registry:    registry,
 		Env:         env,
 		Files:       files,
 		Queue:       r.Queue,
 		Error:       r.Error,
 		Pre:         pre,
 		Post:        post,
-		Volumes:     r.Volumes,
+		Mounts:      mounts,
 		Networks:    r.Networks,
 		NodeID:      r.NodeID,
 		Retry:       retry,
@@ -187,7 +203,7 @@ func (r taskRecord) toTask() (*tork.Task, error) {
 	}, nil
 }
 
-func (r nodeRecord) toNode() tork.Node {
+func (r nodeRecord) toNode() *tork.Node {
 	n := tork.Node{
 		ID:              r.ID,
 		StartedAt:       r.StartedAt,
@@ -204,17 +220,24 @@ func (r nodeRecord) toNode() tork.Node {
 	if n.LastHeartbeatAt.Before(time.Now().UTC().Add(-tork.HEARTBEAT_RATE * 2)) {
 		n.Status = tork.NodeStatusOffline
 	}
-	return n
+	return &n
 }
 
 func (r jobRecord) toJob(tasks, execution []*tork.Task) (*tork.Job, error) {
 	var c tork.JobContext
 	if err := json.Unmarshal(r.Context, &c); err != nil {
-		return nil, errors.Wrapf(err, "error deserializing task.context")
+		return nil, errors.Wrapf(err, "error deserializing job.context")
 	}
 	var inputs map[string]string
 	if err := json.Unmarshal(r.Inputs, &inputs); err != nil {
-		return nil, errors.Wrapf(err, "error deserializing task.inputs")
+		return nil, errors.Wrapf(err, "error deserializing job.inputs")
+	}
+	var defaults *tork.JobDefaults
+	if r.Defaults != nil {
+		defaults = &tork.JobDefaults{}
+		if err := json.Unmarshal(r.Defaults, defaults); err != nil {
+			return nil, errors.Wrapf(err, "error deserializing job.defaults")
+		}
 	}
 	return &tork.Job{
 		ID:          r.ID,
@@ -235,6 +258,7 @@ func (r jobRecord) toJob(tasks, execution []*tork.Task) (*tork.Job, error) {
 		Output:      r.Output,
 		Result:      r.Result,
 		Error:       r.Error,
+		Defaults:    defaults,
 	}, nil
 }
 
@@ -320,6 +344,24 @@ func (ds *PostgresDatastore) CreateTask(ctx context.Context, t *tork.Task) error
 		s := string(b)
 		subjob = &s
 	}
+	var registry *string
+	if t.Registry != nil {
+		b, err := json.Marshal(t.Registry)
+		if err != nil {
+			return errors.Wrapf(err, "failed to serialize task.registry")
+		}
+		s := string(b)
+		registry = &s
+	}
+	var mounts *string
+	if len(t.Mounts) > 0 {
+		b, err := json.Marshal(t.Mounts)
+		if err != nil {
+			return errors.Wrapf(err, "failed to serialize task.mounts")
+		}
+		s := string(b)
+		mounts = &s
+	}
 	q := `insert into tasks (
 		    id, -- $1
 			job_id, -- $2
@@ -340,7 +382,7 @@ func (ds *PostgresDatastore) CreateTask(ctx context.Context, t *tork.Task) error
 			error_, -- $17
 			pre_tasks, -- $18
 			post_tasks, -- $19
-			volumes, -- $20
+			mounts, -- $20
 			node_id, -- $21
 			retry, -- $22
 			limits, -- $23
@@ -353,12 +395,13 @@ func (ds *PostgresDatastore) CreateTask(ctx context.Context, t *tork.Task) error
 			description, -- $30
 			subjob, -- $31
 			networks, -- $32
-			files_ -- $33
+			files_, -- $33
+			registry -- $34
 		  ) 
 	      values (
 			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
 		    $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,
-			$27,$28,$29,$30,$31,$32,$33)`
+			$27,$28,$29,$30,$31,$32,$33,$34)`
 	_, err = ds.exec(q,
 		t.ID,                         // $1
 		t.JobID,                      // $2
@@ -379,7 +422,7 @@ func (ds *PostgresDatastore) CreateTask(ctx context.Context, t *tork.Task) error
 		sanitizeString(t.Error),      // $17
 		pre,                          // $18
 		post,                         // $19
-		pq.StringArray(t.Volumes),    // $20
+		mounts,                       // $20
 		t.NodeID,                     // $21
 		retry,                        // $22
 		limits,                       // $23
@@ -393,6 +436,7 @@ func (ds *PostgresDatastore) CreateTask(ctx context.Context, t *tork.Task) error
 		subjob,                       // $31
 		pq.StringArray(t.Networks),   // $32
 		files,                        // $33
+		registry,                     // $34
 	)
 	if err != nil {
 		return errors.Wrapf(err, "error inserting task to the db")
@@ -459,6 +503,24 @@ func (ds *PostgresDatastore) UpdateTask(ctx context.Context, id string, modify f
 			s := string(b)
 			subjob = &s
 		}
+		var limits *string
+		if t.Limits != nil {
+			b, err := json.Marshal(t.Limits)
+			if err != nil {
+				return errors.Wrapf(err, "failed to serialize task.limits")
+			}
+			s := string(b)
+			limits = &s
+		}
+		var retry *string
+		if t.Retry != nil {
+			b, err := json.Marshal(t.Retry)
+			if err != nil {
+				return errors.Wrapf(err, "failed to serialize task.retry")
+			}
+			s := string(b)
+			retry = &s
+		}
 		q := `update tasks set 
 				position = $1,
 				state = $2,
@@ -471,8 +533,11 @@ func (ds *PostgresDatastore) UpdateTask(ctx context.Context, id string, modify f
 				result = $9,
 				each_ = $10,
 				subjob = $11,
-				parallel = $12
-			  where id = $13`
+				parallel = $12,
+				limits = $13,
+				timeout = $14,
+				retry = $15
+			  where id = $16`
 		_, err = ptx.exec(q,
 			t.Position,               // $1
 			t.State,                  // $2
@@ -486,7 +551,10 @@ func (ds *PostgresDatastore) UpdateTask(ctx context.Context, id string, modify f
 			each,                     // $10
 			subjob,                   // $11
 			parallel,                 // $12
-			t.ID,                     // $13
+			limits,                   // $13
+			t.Timeout,                // $14
+			retry,                    // $15
+			t.ID,                     // $16
 		)
 		if err != nil {
 			return errors.Wrapf(err, "error updating task %s", t.ID)
@@ -495,7 +563,7 @@ func (ds *PostgresDatastore) UpdateTask(ctx context.Context, id string, modify f
 	})
 }
 
-func (ds *PostgresDatastore) CreateNode(ctx context.Context, n tork.Node) error {
+func (ds *PostgresDatastore) CreateNode(ctx context.Context, n *tork.Node) error {
 	q := `insert into nodes 
 	       (id,started_at,last_heartbeat_at,cpu_percent,queue,status,hostname,task_count,version_) 
 	      values
@@ -518,7 +586,7 @@ func (ds *PostgresDatastore) UpdateNode(ctx context.Context, id string, modify f
 			return errors.Wrapf(err, "error fetching node from db")
 		}
 		n := nr.toNode()
-		if err := modify(&n); err != nil {
+		if err := modify(n); err != nil {
 			return err
 		}
 		q := `update nodes set 
@@ -535,18 +603,18 @@ func (ds *PostgresDatastore) UpdateNode(ctx context.Context, id string, modify f
 	})
 }
 
-func (ds *PostgresDatastore) GetNodeByID(ctx context.Context, id string) (tork.Node, error) {
+func (ds *PostgresDatastore) GetNodeByID(ctx context.Context, id string) (*tork.Node, error) {
 	nr := nodeRecord{}
 	if err := ds.get(&nr, `SELECT * FROM nodes where id = $1`, id); err != nil {
 		if err == sql.ErrNoRows {
-			return tork.Node{}, ErrNodeNotFound
+			return nil, ErrNodeNotFound
 		}
-		return tork.Node{}, errors.Wrapf(err, "error fetching task from db")
+		return nil, errors.Wrapf(err, "error fetching task from db")
 	}
 	return nr.toNode(), nil
 }
 
-func (ds *PostgresDatastore) GetActiveNodes(ctx context.Context) ([]tork.Node, error) {
+func (ds *PostgresDatastore) GetActiveNodes(ctx context.Context) ([]*tork.Node, error) {
 	nrs := []nodeRecord{}
 	q := `SELECT * 
 	      FROM nodes 
@@ -556,7 +624,7 @@ func (ds *PostgresDatastore) GetActiveNodes(ctx context.Context) ([]tork.Node, e
 	if err := ds.select_(&nrs, q, timeout); err != nil {
 		return nil, errors.Wrapf(err, "error getting active nodes from db")
 	}
-	ns := make([]tork.Node, len(nrs))
+	ns := make([]*tork.Node, len(nrs))
 	for i, n := range nrs {
 
 		ns[i] = n.toNode()
@@ -580,11 +648,17 @@ func (ds *PostgresDatastore) CreateJob(ctx context.Context, j *tork.Job) error {
 	if err != nil {
 		return errors.Wrapf(err, "failed to serialize job.inputs")
 	}
+	defaults, err := json.Marshal(j.Defaults)
+	if err != nil {
+		return errors.Wrapf(err, "failed to serialize job.defaults")
+	}
 	q := `insert into jobs 
-	       (id,name,description,state,created_at,started_at,tasks,position,inputs,context,parent_id,task_count,output_,result,error_) 
+	       (id,name,description,state,created_at,started_at,tasks,position,
+			inputs,context,parent_id,task_count,output_,result,error_,defaults) 
 	      values
-	       ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`
-	_, err = ds.exec(q, j.ID, j.Name, j.Description, j.State, j.CreatedAt, j.StartedAt, tasks, j.Position, inputs, c, j.ParentID, j.TaskCount, j.Output, j.Result, j.Error)
+	       ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`
+	_, err = ds.exec(q, j.ID, j.Name, j.Description, j.State, j.CreatedAt, j.StartedAt, tasks, j.Position,
+		inputs, c, j.ParentID, j.TaskCount, j.Output, j.Result, j.Error, defaults)
 	if err != nil {
 		return errors.Wrapf(err, "error inserting job to the db")
 	}
@@ -685,7 +759,7 @@ func (ds *PostgresDatastore) GetActiveTasks(ctx context.Context, jobID string) (
 	return actives, nil
 }
 
-func (ds *PostgresDatastore) GetJobs(ctx context.Context, q string, page, size int) (*Page[*tork.Job], error) {
+func (ds *PostgresDatastore) GetJobs(ctx context.Context, q string, page, size int) (*Page[*tork.JobSummary], error) {
 	offset := (page - 1) * size
 	rs := make([]jobRecord, 0)
 	qry := fmt.Sprintf(`
@@ -698,13 +772,13 @@ func (ds *PostgresDatastore) GetJobs(ctx context.Context, q string, page, size i
 	if err := ds.select_(&rs, qry, q); err != nil {
 		return nil, errors.Wrapf(err, "error getting a page of jobs")
 	}
-	result := make([]*tork.Job, len(rs))
+	result := make([]*tork.JobSummary, len(rs))
 	for i, r := range rs {
 		j, err := r.toJob([]*tork.Task{}, []*tork.Task{})
 		if err != nil {
 			return nil, err
 		}
-		result[i] = j
+		result[i] = tork.NewJobSummary(j)
 	}
 
 	var count *int
@@ -723,7 +797,7 @@ func (ds *PostgresDatastore) GetJobs(ctx context.Context, q string, page, size i
 		totalPages = totalPages + 1
 	}
 
-	return &Page[*tork.Job]{
+	return &Page[*tork.JobSummary]{
 		Items:      result,
 		Number:     page,
 		Size:       len(result),
@@ -732,8 +806,8 @@ func (ds *PostgresDatastore) GetJobs(ctx context.Context, q string, page, size i
 	}, nil
 }
 
-func (ds *PostgresDatastore) GetStats(ctx context.Context) (*tork.Stats, error) {
-	s := &tork.Stats{}
+func (ds *PostgresDatastore) GetMetrics(ctx context.Context) (*tork.Metrics, error) {
+	s := &tork.Metrics{}
 
 	if err := ds.get(&s.Jobs.Running, "select count(*) from jobs where state = 'RUNNING'"); err != nil {
 		return nil, errors.Wrapf(err, "error getting the running jobs count")
@@ -808,6 +882,19 @@ func (ds *PostgresDatastore) WithTx(ctx context.Context, f func(tx Datastore) er
 		if err := tx.Commit(); err != nil {
 			return errors.Wrapf(err, "error committing transaction")
 		}
+	}
+	return nil
+}
+
+func (ds *PostgresDatastore) HealthCheck(ctx context.Context) error {
+	if _, err := ds.db.ExecContext(ctx, "select 1 from jobs limit 1"); err != nil {
+		return errors.Wrapf(err, "error reading from jobs table")
+	}
+	if _, err := ds.db.ExecContext(ctx, "select 1 from tasks limit 1"); err != nil {
+		return errors.Wrapf(err, "error reading from tasks table")
+	}
+	if _, err := ds.db.ExecContext(ctx, "select 1 from nodes limit 1"); err != nil {
+		return errors.Wrapf(err, "error reading from nodes table")
 	}
 	return nil
 }

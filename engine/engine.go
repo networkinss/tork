@@ -1,20 +1,26 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
-	"github.com/runabol/tork/conf"
+
+	"github.com/runabol/tork"
 	"github.com/runabol/tork/datastore"
+	"github.com/runabol/tork/input"
 	"github.com/runabol/tork/internal/coordinator"
 	"github.com/runabol/tork/internal/worker"
-	"github.com/runabol/tork/middleware"
+	"github.com/runabol/tork/middleware/job"
+	"github.com/runabol/tork/middleware/node"
+	"github.com/runabol/tork/middleware/task"
+	"github.com/runabol/tork/middleware/web"
 	"github.com/runabol/tork/mq"
-	"github.com/runabol/tork/runtime"
 )
 
 const (
@@ -25,249 +31,259 @@ const (
 
 type Mode string
 
+const (
+	StateIdle        = "IDLE"
+	StateRunning     = "RUNNING"
+	StateTerminating = "TERMINATING"
+	StateTerminated  = "TERMINATED"
+)
+
 type Engine struct {
 	quit        chan os.Signal
 	terminate   chan any
-	onStarted   func() error
-	middlewares []middleware.MiddlewareFunc
-	endpoints   map[string]middleware.HandlerFunc
-	mode        Mode
+	terminated  chan any
+	cfg         Config
+	state       string
+	mu          sync.Mutex
+	broker      mq.Broker
+	ds          datastore.Datastore
+	coordinator *coordinator.Coordinator
+	worker      *worker.Worker
 }
 
-func New(mode Mode) *Engine {
-	return &Engine{
-		quit:        make(chan os.Signal, 1),
-		terminate:   make(chan any, 1),
-		onStarted:   func() error { return nil },
-		middlewares: make([]middleware.MiddlewareFunc, 0),
-		endpoints:   make(map[string]middleware.HandlerFunc, 0),
-		mode:        mode,
+type Config struct {
+	Mode       Mode
+	Middleware Middleware
+	Endpoints  map[string]web.HandlerFunc
+}
+
+type Middleware struct {
+	Web  []web.MiddlewareFunc
+	Task []task.MiddlewareFunc
+	Job  []job.MiddlewareFunc
+	Node []node.MiddlewareFunc
+}
+
+func New(cfg Config) *Engine {
+	if cfg.Endpoints == nil {
+		cfg.Endpoints = make(map[string]web.HandlerFunc)
 	}
+	return &Engine{
+		quit:       make(chan os.Signal, 1),
+		terminate:  make(chan any),
+		terminated: make(chan any),
+		cfg:        cfg,
+		state:      StateIdle,
+	}
+}
+
+func (e *Engine) State() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.state
 }
 
 func (e *Engine) Start() error {
-	switch e.mode {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	var err error
+	switch e.cfg.Mode {
 	case ModeCoordinator:
-		return e.runCoordinator()
+		err = e.runCoordinator()
 	case ModeWorker:
-		return e.runWorker()
+		err = e.runWorker()
 	case ModeStandalone:
-		return e.runStandalone()
-
+		err = e.runStandalone()
 	default:
-		return errors.Errorf("Unknown mode: %s", e.mode)
+		err = errors.Errorf("Unknown mode: %s", e.cfg.Mode)
 	}
+	if err == nil {
+		e.state = StateRunning
+	}
+	return err
 }
 
-func (e *Engine) Terminate() {
+func (e *Engine) Run() error {
+	if err := e.Start(); err != nil {
+		return err
+	}
+	<-e.terminated
+	return nil
+}
+
+func (e *Engine) Terminate() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateRunning)
+	e.state = StateTerminating
+	log.Debug().Msg("Terminating engine")
 	e.terminate <- 1
+	<-e.terminated
+	e.state = StateTerminated
+	return nil
 }
 
-func (e *Engine) OnStarted(h OnStartedHandler) {
-	e.onStarted = h
+func (e *Engine) SetMode(mode Mode) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	e.cfg.Mode = mode
 }
 
 func (e *Engine) runCoordinator() error {
-	broker, err := createBroker()
-	if err != nil {
+	if err := e.initBroker(); err != nil {
 		return err
 	}
 
-	ds, err := createDatastore()
-	if err != nil {
+	if err := e.initDatastore(); err != nil {
 		return err
 	}
 
-	c, err := e.createCoordinator(broker, ds)
-	if err != nil {
+	if err := e.initCoordinator(); err != nil {
 		return err
 	}
 
-	// trigger the on-started hook
-	if err := e.onStarted(); err != nil {
-		return errors.Wrapf(err, "error on-started hook")
-	}
+	go func() {
+		e.awaitTerm()
 
-	e.awaitTerm()
-
-	log.Debug().Msg("shutting down")
-	if c != nil {
-		if err := c.Stop(); err != nil {
-			log.Error().Err(err).Msg("error stopping coordinator")
+		log.Debug().Msg("shutting down")
+		if e.coordinator != nil {
+			if err := e.coordinator.Stop(); err != nil {
+				log.Error().Err(err).Msg("error stopping coordinator")
+			}
 		}
-	}
+		close(e.terminated)
+	}()
+
 	return nil
 }
 
 func (e *Engine) runWorker() error {
-	broker, err := createBroker()
-	if err != nil {
+	if err := e.initBroker(); err != nil {
 		return err
 	}
 
-	w, err := createWorker(broker)
-	if err != nil {
+	if err := e.initWorker(); err != nil {
 		return err
 	}
 
-	// trigger the on-started hook
-	if err := e.onStarted(); err != nil {
-		return errors.Wrapf(err, "error on-started hook")
-	}
+	go func() {
+		e.awaitTerm()
 
-	e.awaitTerm()
-
-	log.Debug().Msg("shutting down")
-	if w != nil {
-		if err := w.Stop(); err != nil {
-			log.Error().Err(err).Msg("error stopping worker")
+		log.Debug().Msg("shutting down")
+		if e.worker != nil {
+			if err := e.worker.Stop(); err != nil {
+				log.Error().Err(err).Msg("error stopping worker")
+			}
 		}
-	}
+		close(e.terminated)
+	}()
 
 	return nil
 }
 
 func (e *Engine) runStandalone() error {
-	broker, err := createBroker()
-	if err != nil {
+	if err := e.initBroker(); err != nil {
 		return err
 	}
 
-	ds, err := createDatastore()
-	if err != nil {
+	if err := e.initDatastore(); err != nil {
 		return err
 	}
 
-	w, err := createWorker(broker)
-	if err != nil {
-		return err
-	}
-	c, err := e.createCoordinator(broker, ds)
-	if err != nil {
+	if err := e.initWorker(); err != nil {
 		return err
 	}
 
-	// trigger the on-started hook
-	if err := e.onStarted(); err != nil {
-		return errors.Wrapf(err, "error on-started hook")
+	if err := e.initCoordinator(); err != nil {
+		return err
 	}
 
-	e.awaitTerm()
+	go func() {
+		e.awaitTerm()
 
-	log.Debug().Msg("shutting down")
-	if w != nil {
-		if err := w.Stop(); err != nil {
-			log.Error().Err(err).Msg("error stopping worker")
+		log.Debug().Msg("shutting down")
+		if e.worker != nil {
+			if err := e.worker.Stop(); err != nil {
+				log.Error().Err(err).Msg("error stopping worker")
+			}
 		}
-	}
-	if c != nil {
-		if err := c.Stop(); err != nil {
-			log.Error().Err(err).Msg("error stopping coordinator")
+		if e.coordinator != nil {
+			if err := e.coordinator.Stop(); err != nil {
+				log.Error().Err(err).Msg("error stopping coordinator")
+			}
 		}
-	}
+		close(e.terminated)
+	}()
 
 	return nil
 }
 
-func createDatastore() (datastore.Datastore, error) {
-	dstype := conf.StringDefault("datastore.type", datastore.DATASTORE_INMEMORY)
-	var ds datastore.Datastore
-	ds, err := datastore.NewFromProvider(dstype)
-	if err != nil && !errors.Is(err, datastore.ErrProviderNotFound) {
-		return nil, err
+func (e *Engine) mustState(state string) {
+	if e.state != state {
+		panic(errors.Errorf("engine is not %s", state))
 	}
-	if ds != nil {
-		return ds, nil
+}
+
+func (e *Engine) RegisterWebMiddleware(mw web.MiddlewareFunc) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	e.cfg.Middleware.Web = append(e.cfg.Middleware.Web, mw)
+}
+
+func (e *Engine) RegisterTaskMiddleware(mw task.MiddlewareFunc) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	e.cfg.Middleware.Task = append(e.cfg.Middleware.Task, mw)
+}
+
+func (e *Engine) RegisterJobMiddleware(mw job.MiddlewareFunc) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	e.cfg.Middleware.Job = append(e.cfg.Middleware.Job, mw)
+}
+
+func (e *Engine) RegisterNodeMiddleware(mw node.MiddlewareFunc) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	e.cfg.Middleware.Node = append(e.cfg.Middleware.Node, mw)
+}
+
+func (e *Engine) RegisterEndpoint(method, path string, handler web.HandlerFunc) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	e.cfg.Endpoints[fmt.Sprintf("%s %s", method, path)] = handler
+}
+
+func (e *Engine) SubmitJob(ctx context.Context, ij *input.Job, listeners ...web.JobListener) (*tork.Job, error) {
+	e.mustState(StateRunning)
+	if e.cfg.Mode != ModeStandalone && e.cfg.Mode != ModeCoordinator {
+		panic(errors.Errorf("engine not in coordinator/standalone mode"))
 	}
-	switch dstype {
-	case datastore.DATASTORE_INMEMORY:
-		ds = datastore.NewInMemoryDatastore()
-	case datastore.DATASTORE_POSTGRES:
-		dsn := conf.StringDefault(
-			"datastore.postgres.dsn",
-			"host=localhost user=tork password=tork dbname=tork port=5432 sslmode=disable",
-		)
-		pg, err := datastore.NewPostgresDataStore(dsn)
-		if err != nil {
-			return nil, err
+	if err := e.broker.SubscribeForEvents(ctx, mq.TOPIC_JOB, func(ev any) {
+		j, ok := ev.(*tork.Job)
+		if !ok {
+			log.Error().Msg("unable to cast event to *tork.Job")
 		}
-		ds = pg
-	default:
-		return nil, errors.Errorf("unknown datastore type: %s", dstype)
-	}
-	return ds, nil
-}
-
-func createBroker() (mq.Broker, error) {
-	var b mq.Broker
-	bt := conf.StringDefault("broker.type", mq.BROKER_INMEMORY)
-
-	b, err := mq.NewFromProvider(bt)
-	if err != nil && !errors.Is(err, mq.ErrProviderNotFound) {
-		return nil, err
-	}
-	if b != nil {
-		return b, nil
-	}
-	switch bt {
-	case "inmemory":
-		b = mq.NewInMemoryBroker()
-	case "rabbitmq":
-		rb, err := mq.NewRabbitMQBroker(conf.StringDefault("broker.rabbitmq.url", "amqp://guest:guest@localhost:5672/"))
-		if err != nil {
-			return nil, errors.Wrapf(err, "unable to connect to RabbitMQ")
+		if ij.ID() == j.ID {
+			for _, listener := range listeners {
+				listener(j)
+			}
 		}
-		b = rb
-	default:
-		return nil, errors.Errorf("invalid broker type: %s", bt)
+	}); err != nil {
+		return nil, errors.New("error subscribing for job events")
 	}
-	return b, nil
-}
-
-func (e *Engine) createCoordinator(broker mq.Broker, ds datastore.Datastore) (*coordinator.Coordinator, error) {
-	queues := conf.IntMap("coordinator.queues")
-	c, err := coordinator.NewCoordinator(coordinator.Config{
-		Broker:      broker,
-		DataStore:   ds,
-		Queues:      queues,
-		Address:     conf.String("coordinator.address"),
-		Middlewares: e.middlewares,
-		Endpoints:   e.endpoints,
-		Enabled:     conf.BoolMap("coordinator.api.endpoints"),
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "error creating the coordinator")
-	}
-	if err := c.Start(); err != nil {
-		return nil, err
-	}
-	return c, nil
-}
-
-func createWorker(b mq.Broker) (*worker.Worker, error) {
-	queues := conf.IntMap("worker.queues")
-	rt, err := runtime.NewDockerRuntime()
+	job, err := e.coordinator.SubmitJob(ctx, ij)
 	if err != nil {
 		return nil, err
 	}
-	w, err := worker.NewWorker(worker.Config{
-		Broker:  b,
-		Runtime: rt,
-		Queues:  queues,
-		Limits: worker.Limits{
-			DefaultCPUsLimit:   conf.String("worker.limits.cpus"),
-			DefaultMemoryLimit: conf.String("worker.limits.memory"),
-		},
-		TempDir: conf.String("worker.tempdir"),
-		Address: conf.String("worker.address"),
-	})
-	if err != nil {
-		return nil, errors.Wrapf(err, "error creating worker")
-	}
-	if err := w.Start(); err != nil {
-		return nil, err
-	}
-	return w, nil
+	return job.Clone(), nil
 }
 
 func (e *Engine) awaitTerm() {
@@ -276,12 +292,4 @@ func (e *Engine) awaitTerm() {
 	case <-e.quit:
 	case <-e.terminate:
 	}
-}
-
-func (e *Engine) RegisterMiddleware(mw middleware.MiddlewareFunc) {
-	e.middlewares = append(e.middlewares, mw)
-}
-
-func (e *Engine) RegisterEndpoint(method, path string, handler middleware.HandlerFunc) {
-	e.endpoints[fmt.Sprintf("%s %s", method, path)] = handler
 }

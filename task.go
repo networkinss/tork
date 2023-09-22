@@ -1,9 +1,10 @@
 package tork
 
 import (
+	"slices"
 	"time"
 
-	"github.com/runabol/tork/internal/clone"
+	"golang.org/x/exp/maps"
 )
 
 // State defines the list of states that a
@@ -18,6 +19,9 @@ const (
 	TaskStateStopped   TaskState = "STOPPED"
 	TaskStateCompleted TaskState = "COMPLETED"
 	TaskStateFailed    TaskState = "FAILED"
+
+	MountTypeVolume string = "volume"
+	MountTypeBind   string = "bind"
 )
 
 // Task is the basic unit of work that a Worker can handle.
@@ -38,13 +42,14 @@ type Task struct {
 	Entrypoint  []string          `json:"entrypoint,omitempty"`
 	Run         string            `json:"run,omitempty"`
 	Image       string            `json:"image,omitempty"`
+	Registry    *Registry         `json:"registry,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
 	Files       map[string]string `json:"files,omitempty"`
 	Queue       string            `json:"queue,omitempty"`
 	Error       string            `json:"error,omitempty"`
 	Pre         []*Task           `json:"pre,omitempty"`
 	Post        []*Task           `json:"post,omitempty"`
-	Volumes     []string          `json:"volumes,omitempty"`
+	Mounts      []Mount           `json:"mounts,omitempty"`
 	Networks    []string          `json:"networks,omitempty"`
 	NodeID      string            `json:"nodeId,omitempty"`
 	Retry       *TaskRetry        `json:"retry,omitempty"`
@@ -56,6 +61,12 @@ type Task struct {
 	Parallel    *ParallelTask     `json:"parallel,omitempty"`
 	Each        *EachTask         `json:"each,omitempty"`
 	SubJob      *SubJobTask       `json:"subjob,omitempty"`
+}
+
+type Mount struct {
+	Type   string `json:"type,omitempty"`
+	Source string `json:"source,omitempty"`
+	Target string `json:"target,omitempty"`
 }
 
 type SubJobTask struct {
@@ -89,6 +100,11 @@ type TaskLimits struct {
 	Memory string `json:"memory,omitempty"`
 }
 
+type Registry struct {
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
 func (s TaskState) IsActive() bool {
 	return s == TaskStatePending ||
 		s == TaskStateScheduled ||
@@ -116,6 +132,10 @@ func (t *Task) Clone() *Task {
 	if t.Parallel != nil {
 		parallel = t.Parallel.Clone()
 	}
+	var registry *Registry
+	if t.Registry != nil {
+		registry = t.Registry.Clone()
+	}
 	return &Task{
 		ID:          t.ID,
 		JobID:       t.JobID,
@@ -132,13 +152,14 @@ func (t *Task) Clone() *Task {
 		Entrypoint:  t.Entrypoint,
 		Run:         t.Run,
 		Image:       t.Image,
-		Env:         clone.CloneStringMap(t.Env),
-		Files:       clone.CloneStringMap(t.Files),
+		Registry:    registry,
+		Env:         maps.Clone(t.Env),
+		Files:       maps.Clone(t.Files),
 		Queue:       t.Queue,
 		Error:       t.Error,
 		Pre:         CloneTasks(t.Pre),
 		Post:        CloneTasks(t.Post),
-		Volumes:     t.Volumes,
+		Mounts:      slices.Clone(t.Mounts),
 		Networks:    t.Networks,
 		NodeID:      t.NodeID,
 		Retry:       retry,
@@ -190,7 +211,7 @@ func (s *SubJobTask) Clone() *SubJobTask {
 		ID:          s.ID,
 		Name:        s.Name,
 		Description: s.Description,
-		Inputs:      clone.CloneStringMap(s.Inputs),
+		Inputs:      maps.Clone(s.Inputs),
 		Tasks:       CloneTasks(s.Tasks),
 		Output:      s.Output,
 	}
@@ -200,5 +221,12 @@ func (p *ParallelTask) Clone() *ParallelTask {
 	return &ParallelTask{
 		Tasks:       CloneTasks(p.Tasks),
 		Completions: p.Completions,
+	}
+}
+
+func (r *Registry) Clone() *Registry {
+	return &Registry{
+		Username: r.Username,
+		Password: r.Password,
 	}
 }

@@ -1,6 +1,8 @@
 package tork
 
-import "time"
+import (
+	"time"
+)
 
 var LAST_HEARTBEAT_TIMEOUT = time.Minute * 5
 var HEARTBEAT_RATE = time.Second * 30
@@ -23,4 +25,18 @@ type Node struct {
 	Hostname        string     `json:"hostname,omitempty"`
 	TaskCount       int        `json:"taskCount"`
 	Version         string     `json:"version"`
+}
+
+func (n *Node) Clone() *Node {
+	return &Node{
+		ID:              n.ID,
+		StartedAt:       n.StartedAt,
+		CPUPercent:      n.CPUPercent,
+		LastHeartbeatAt: n.LastHeartbeatAt,
+		Queue:           n.Queue,
+		Status:          n.Status,
+		Hostname:        n.Hostname,
+		TaskCount:       n.TaskCount,
+		Version:         n.Version,
+	}
 }

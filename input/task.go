@@ -2,7 +2,7 @@ package input
 
 import (
 	"github.com/runabol/tork"
-	"github.com/runabol/tork/internal/clone"
+	"golang.org/x/exp/maps"
 )
 
 type Task struct {
@@ -12,12 +12,13 @@ type Task struct {
 	Entrypoint  []string          `json:"entrypoint,omitempty" yaml:"entrypoint,omitempty"`
 	Run         string            `json:"run,omitempty" yaml:"run,omitempty"`
 	Image       string            `json:"image,omitempty" yaml:"image,omitempty"`
+	Registry    *Registry         `json:"registry,omitempty" yaml:"registry,omitempty"`
 	Env         map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
 	Files       map[string]string `json:"files,omitempty" yaml:"files,omitempty"`
 	Queue       string            `json:"queue,omitempty" yaml:"queue,omitempty" validate:"queue"`
 	Pre         []AuxTask         `json:"pre,omitempty" yaml:"pre,omitempty" validate:"dive"`
 	Post        []AuxTask         `json:"post,omitempty" yaml:"post,omitempty" validate:"dive"`
-	Volumes     []string          `json:"volumes,omitempty" yaml:"volumes,omitempty"`
+	Mounts      []Mount           `json:"mounts,omitempty" yaml:"mounts,omitempty" validate:"dive"`
 	Networks    []string          `json:"networks,omitempty" yaml:"networks,omitempty"`
 	Retry       *Retry            `json:"retry,omitempty" yaml:"retry,omitempty"`
 	Limits      *Limits           `json:"limits,omitempty" yaml:"limits,omitempty"`
@@ -28,6 +29,11 @@ type Task struct {
 	Each        *Each             `json:"each,omitempty" yaml:"each,omitempty"`
 	SubJob      *SubJob           `json:"subjob,omitempty" yaml:"subjob,omitempty"`
 }
+type Mount struct {
+	Type   string `json:"type,omitempty" yaml:"type,omitempty"`
+	Source string `json:"source,omitempty" yaml:"source,omitempty"`
+	Target string `json:"target,omitempty" yaml:"target,omitempty"`
+}
 
 type AuxTask struct {
 	Name        string            `json:"name,omitempty" yaml:"name,omitempty" validate:"required"`
@@ -36,11 +42,27 @@ type AuxTask struct {
 	Entrypoint  []string          `json:"entrypoint,omitempty" yaml:"entrypoint,omitempty"`
 	Run         string            `json:"run,omitempty" yaml:"run,omitempty"`
 	Image       string            `json:"image,omitempty" yaml:"image,omitempty" validate:"required"`
+	Registry    *Registry         `json:"registry,omitempty" yaml:"registry,omitempty"`
 	Env         map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
 	Timeout     string            `json:"timeout,omitempty" yaml:"timeout,omitempty"`
 }
 
+func (m Mount) toMount() tork.Mount {
+	return tork.Mount{
+		Type:   m.Type,
+		Source: m.Source,
+		Target: m.Target,
+	}
+}
+
 func (i AuxTask) toTask() *tork.Task {
+	var registry *tork.Registry
+	if i.Registry != nil {
+		registry = &tork.Registry{
+			Username: i.Registry.Username,
+			Password: i.Registry.Password,
+		}
+	}
 	return &tork.Task{
 		Name:        i.Name,
 		Description: i.Description,
@@ -50,6 +72,7 @@ func (i AuxTask) toTask() *tork.Task {
 		Image:       i.Image,
 		Env:         i.Env,
 		Timeout:     i.Timeout,
+		Registry:    registry,
 	}
 }
 
@@ -58,16 +81,11 @@ func (i Task) toTask() *tork.Task {
 	post := toAuxTasks(i.Post)
 	var retry *tork.TaskRetry
 	if i.Retry != nil {
-		retry = &tork.TaskRetry{
-			Limit: i.Retry.Limit,
-		}
+		retry = i.Retry.toTaskRetry()
 	}
 	var limits *tork.TaskLimits
 	if i.Limits != nil {
-		limits = &tork.TaskLimits{
-			CPUs:   i.Limits.CPUs,
-			Memory: i.Limits.Memory,
-		}
+		limits = i.Limits.toTaskLimits()
 	}
 	var each *tork.EachTask
 	if i.Each != nil {
@@ -82,7 +100,7 @@ func (i Task) toTask() *tork.Task {
 			Name:        i.SubJob.Name,
 			Description: i.SubJob.Description,
 			Tasks:       toTasks(i.SubJob.Tasks),
-			Inputs:      clone.CloneStringMap(i.SubJob.Inputs),
+			Inputs:      maps.Clone(i.SubJob.Inputs),
 			Output:      i.SubJob.Output,
 		}
 	}
@@ -92,6 +110,13 @@ func (i Task) toTask() *tork.Task {
 			Tasks: toTasks(i.Parallel.Tasks),
 		}
 	}
+	var registry *tork.Registry
+	if i.Registry != nil {
+		registry = &tork.Registry{
+			Username: i.Registry.Username,
+			Password: i.Registry.Password,
+		}
+	}
 	return &tork.Task{
 		Name:        i.Name,
 		Description: i.Description,
@@ -99,12 +124,13 @@ func (i Task) toTask() *tork.Task {
 		Entrypoint:  i.Entrypoint,
 		Run:         i.Run,
 		Image:       i.Image,
+		Registry:    registry,
 		Env:         i.Env,
 		Files:       i.Files,
 		Queue:       i.Queue,
 		Pre:         pre,
 		Post:        post,
-		Volumes:     i.Volumes,
+		Mounts:      toMounts(i.Mounts),
 		Networks:    i.Networks,
 		Retry:       retry,
 		Limits:      limits,
@@ -115,6 +141,14 @@ func (i Task) toTask() *tork.Task {
 		Each:        each,
 		SubJob:      subjob,
 	}
+}
+
+func toMounts(ms []Mount) []tork.Mount {
+	result := make([]tork.Mount, len(ms))
+	for i, m := range ms {
+		result[i] = m.toMount()
+	}
+	return result
 }
 
 func toAuxTasks(tis []AuxTask) []*tork.Task {
@@ -131,6 +165,19 @@ func toTasks(tis []Task) []*tork.Task {
 		result[i] = ti.toTask()
 	}
 	return result
+}
+
+func (l *Limits) toTaskLimits() *tork.TaskLimits {
+	return &tork.TaskLimits{
+		CPUs:   l.CPUs,
+		Memory: l.Memory,
+	}
+}
+
+func (r *Retry) toTaskRetry() *tork.TaskRetry {
+	return &tork.TaskRetry{
+		Limit: r.Limit,
+	}
 }
 
 type SubJob struct {
@@ -158,4 +205,9 @@ type Retry struct {
 type Limits struct {
 	CPUs   string `json:"cpus,omitempty" yaml:"cpus,omitempty"`
 	Memory string `json:"memory,omitempty" yaml:"memory,omitempty"`
+}
+
+type Registry struct {
+	Username string `json:"username,omitempty" yaml:"username,omitempty"`
+	Password string `json:"password,omitempty" yaml:"password,omitempty"`
 }

@@ -24,13 +24,10 @@ func (c *CLI) run(ctx *ucli.Context) error {
 		}
 		fmt.Println("missing required argument: mode")
 		os.Exit(1)
-
 	}
-	eng := engine.New(engine.Mode(ctx.Args().First()))
-	for _, co := range c.configurers {
-		if err := co(eng); err != nil {
-			return err
-		}
+	engine.SetMode(engine.Mode(mode))
+	if err := engine.Run(); err != nil {
+		return err
 	}
-	return eng.Start()
+	return nil
 }

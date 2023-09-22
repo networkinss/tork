@@ -32,7 +32,8 @@ CREATE TABLE jobs (
     task_count    int         not null,
     output_       text,
     result        text,
-    error_        text
+    error_        text,
+    defaults      jsonb
 );
 
 CREATE INDEX idx_jobs_state ON jobs (state);
@@ -63,13 +64,14 @@ CREATE TABLE tasks (
     entrypoint    text[],
     run_script    text,
     image         varchar(256),
+    registry      jsonb,
     env           jsonb,
     files_        jsonb,
     queue         varchar(256),
     error_        text,
     pre_tasks     jsonb,
     post_tasks    jsonb,
-    volumes       text[],
+    mounts       jsonb,
     node_id       varchar(32),
     retry         jsonb,
     limits        jsonb,

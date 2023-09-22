@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -55,18 +56,17 @@ func Test_handleTaskRun(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, w)
 
-	completions := 0
+	completions := make(chan any)
 	err = b.SubscribeForTasks(mq.QUEUE_COMPLETED, func(tk *tork.Task) error {
-		assert.Equal(t, int32(0), atomic.LoadInt32(&w.taskCount))
-		completions = completions + 1
+		close(completions)
 		return nil
 	})
 	assert.NoError(t, err)
 
-	starts := 0
+	starts := make(chan any)
 	err = b.SubscribeForTasks(mq.QUEUE_STARTED, func(tk *tork.Task) error {
-		assert.Equal(t, int32(1), w.taskCount)
-		starts = starts + 1
+		assert.Equal(t, int32(1), atomic.LoadInt32(&w.taskCount))
+		close(starts)
 		return nil
 	})
 	assert.NoError(t, err)
@@ -75,22 +75,156 @@ func Test_handleTaskRun(t *testing.T) {
 	assert.NoError(t, err)
 
 	t1 := &tork.Task{
-		ID:      uuid.NewUUID(),
-		State:   tork.TaskStateScheduled,
-		Image:   "ubuntu:mantic",
-		CMD:     []string{"ls"},
-		Volumes: []string{"/somevolume"},
+		ID:    uuid.NewUUID(),
+		State: tork.TaskStateScheduled,
+		Image: "ubuntu:mantic",
+		CMD:   []string{"ls"},
+		Mounts: []tork.Mount{
+			{
+				Type:   tork.MountTypeVolume,
+				Target: "/somevolume",
+			},
+		},
 	}
 
 	err = w.handleTask(t1)
 
-	// give the task some time to "process"
-	time.Sleep(time.Millisecond * 100)
+	<-starts
+	<-completions
 
 	assert.NoError(t, err)
-	assert.Equal(t, 1, completions)
-	assert.Equal(t, 1, starts)
-	assert.Equal(t, []string{"/somevolume"}, t1.Volumes)
+	assert.Equal(t, "/somevolume", t1.Mounts[0].Target)
+}
+
+func Test_createMountVolume(t *testing.T) {
+	rt, err := runtime.NewDockerRuntime()
+	assert.NoError(t, err)
+
+	b := mq.NewInMemoryBroker()
+
+	w, err := NewWorker(Config{
+		Broker:  b,
+		Runtime: rt,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, w)
+
+	mount := &tork.Mount{
+		Type:   tork.MountTypeVolume,
+		Target: "/somevol",
+	}
+
+	delete, err := w.prepareMount(context.Background(), mount)
+	assert.NoError(t, err)
+	defer func() {
+		assert.NoError(t, delete())
+	}()
+	assert.Equal(t, "/somevol", mount.Target)
+	assert.NotEmpty(t, mount.Source)
+}
+
+func Test_createMountBindNotAllowed(t *testing.T) {
+	rt, err := runtime.NewDockerRuntime()
+	assert.NoError(t, err)
+
+	b := mq.NewInMemoryBroker()
+
+	w, err := NewWorker(Config{
+		Broker:  b,
+		Runtime: rt,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, w)
+
+	_, err = w.prepareMount(context.Background(), &tork.Mount{
+		Type:   tork.MountTypeBind,
+		Source: "/tmp",
+		Target: "/somevol",
+	})
+	assert.Error(t, err)
+}
+
+func Test_createMountBindDenylist(t *testing.T) {
+	rt, err := runtime.NewDockerRuntime()
+	assert.NoError(t, err)
+
+	b := mq.NewInMemoryBroker()
+
+	w, err := NewWorker(Config{
+		Broker:  b,
+		Runtime: rt,
+		BindMounts: Mounts{
+			Allowed:  true,
+			Denylist: []string{"/tmp"},
+		},
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, w)
+
+	_, err = w.prepareMount(context.Background(), &tork.Mount{
+		Type:   tork.MountTypeBind,
+		Source: "/tmp",
+		Target: "/somevol",
+	})
+	assert.Error(t, err)
+}
+
+func Test_createMountBindAllowlist(t *testing.T) {
+	rt, err := runtime.NewDockerRuntime()
+	assert.NoError(t, err)
+
+	b := mq.NewInMemoryBroker()
+
+	w, err := NewWorker(Config{
+		Broker:  b,
+		Runtime: rt,
+		BindMounts: Mounts{
+			Allowed:   true,
+			Allowlist: []string{"/tmp"},
+		},
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, w)
+
+	mount := tork.Mount{
+		Type:   tork.MountTypeBind,
+		Source: "/tmp",
+		Target: "/somevol",
+	}
+
+	delete, err := w.prepareMount(context.Background(), &mount)
+	assert.NoError(t, err)
+	defer func() {
+		assert.NoError(t, delete())
+	}()
+	assert.Equal(t, "/somevol", mount.Target)
+	assert.Equal(t, "/tmp", mount.Source)
+	assert.Equal(t, tork.MountTypeBind, mount.Type)
+}
+
+func Test_createMountBindNotInAllowlist(t *testing.T) {
+	rt, err := runtime.NewDockerRuntime()
+	assert.NoError(t, err)
+
+	b := mq.NewInMemoryBroker()
+
+	w, err := NewWorker(Config{
+		Broker:  b,
+		Runtime: rt,
+		BindMounts: Mounts{
+			Allowed:   true,
+			Allowlist: []string{"/tmp"},
+		},
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, w)
+
+	_, err = w.prepareMount(context.Background(), &tork.Mount{
+		Type:   tork.MountTypeBind,
+		Source: "/other",
+		Target: "/somevol",
+	})
+	assert.Error(t, err)
 }
 
 func Test_handleTaskRunOutput(t *testing.T) {
@@ -128,9 +262,9 @@ func Test_handleTaskRunWithPrePost(t *testing.T) {
 
 	b := mq.NewInMemoryBroker()
 
-	completions := 0
+	completions := make(chan any)
 	err = b.SubscribeForTasks(mq.QUEUE_COMPLETED, func(tk *tork.Task) error {
-		completions = completions + 1
+		close(completions)
 		return nil
 	})
 	assert.NoError(t, err)
@@ -145,11 +279,16 @@ func Test_handleTaskRunWithPrePost(t *testing.T) {
 	assert.NoError(t, err)
 
 	t1 := &tork.Task{
-		ID:      uuid.NewUUID(),
-		State:   tork.TaskStateScheduled,
-		Image:   "ubuntu:mantic",
-		CMD:     []string{"ls"},
-		Volumes: []string{"/somevolume"},
+		ID:    uuid.NewUUID(),
+		State: tork.TaskStateScheduled,
+		Image: "ubuntu:mantic",
+		CMD:   []string{"ls"},
+		Mounts: []tork.Mount{
+			{
+				Type:   tork.MountTypeVolume,
+				Target: "/somevolume",
+			},
+		},
 		Pre: []*tork.Task{
 			{
 				Image: "ubuntu:mantic",
@@ -166,12 +305,10 @@ func Test_handleTaskRunWithPrePost(t *testing.T) {
 
 	err = w.handleTask(t1)
 
-	// give the task some time to "process"
-	time.Sleep(time.Millisecond * 100)
+	<-completions
 
 	assert.NoError(t, err)
-	assert.Equal(t, 1, completions)
-	assert.Equal(t, []string{"/somevolume"}, t1.Volumes)
+	assert.Equal(t, "/somevolume", t1.Mounts[0].Target)
 }
 
 func Test_handleTaskCancel(t *testing.T) {
@@ -188,17 +325,17 @@ func Test_handleTaskCancel(t *testing.T) {
 
 	tid := uuid.NewUUID()
 
-	errs := 0
+	errs := make(chan any)
 	err = b.SubscribeForTasks(mq.QUEUE_ERROR, func(tk *tork.Task) error {
-		errs = errs + 1
 		assert.NotEmpty(t, tk.Error)
+		close(errs)
 		return nil
 	})
 	assert.NoError(t, err)
 
 	// cancel the task immediately upon start
 	err = b.SubscribeForTasks(mq.QUEUE_STARTED, func(tk *tork.Task) error {
-		err = w.handleTask(&tork.Task{
+		err := w.handleTask(&tork.Task{
 			ID:    tid,
 			State: tork.TaskStateCancelled,
 		})
@@ -220,10 +357,7 @@ func Test_handleTaskCancel(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
-	// some time to process the task
-	time.Sleep(time.Millisecond * 100)
-
-	assert.Equal(t, 1, errs)
+	<-errs
 }
 
 func Test_handleTaskError(t *testing.T) {
@@ -232,10 +366,10 @@ func Test_handleTaskError(t *testing.T) {
 
 	b := mq.NewInMemoryBroker()
 
-	errs := 0
+	errs := make(chan any)
 	err = b.SubscribeForTasks(mq.QUEUE_ERROR, func(tk *tork.Task) error {
-		errs = errs + 1
 		assert.NotEmpty(t, tk.Error)
+		close(errs)
 		return nil
 	})
 	assert.NoError(t, err)
@@ -256,11 +390,9 @@ func Test_handleTaskError(t *testing.T) {
 		CMD:   []string{"no_such_thing"},
 	})
 
-	// give the task some time to "process"
-	time.Sleep(time.Millisecond * 100)
+	<-errs
 
 	assert.NoError(t, err)
-	assert.Equal(t, 1, errs)
 }
 
 func Test_handleTaskOutput(t *testing.T) {
@@ -269,10 +401,10 @@ func Test_handleTaskOutput(t *testing.T) {
 
 	b := mq.NewInMemoryBroker()
 
-	completions := 0
+	completions := make(chan any)
 	err = b.SubscribeForTasks(mq.QUEUE_COMPLETED, func(tk *tork.Task) error {
-		completions = completions + 1
 		assert.NotEmpty(t, tk.Result)
+		close(completions)
 		return nil
 	})
 	assert.NoError(t, err)
@@ -293,11 +425,9 @@ func Test_handleTaskOutput(t *testing.T) {
 		Run:   "echo -n 'hello world' >> $TORK_OUTPUT",
 	})
 
-	// give the task some time to "process"
-	time.Sleep(time.Millisecond * 100)
+	<-completions
 
 	assert.NoError(t, err)
-	assert.Equal(t, 1, completions)
 }
 
 func Test_sendHeartbeat(t *testing.T) {
@@ -307,7 +437,7 @@ func Test_sendHeartbeat(t *testing.T) {
 	b := mq.NewInMemoryBroker()
 
 	heartbeats := 0
-	err = b.SubscribeForHeartbeats(func(n tork.Node) error {
+	err = b.SubscribeForHeartbeats(func(n *tork.Node) error {
 		assert.Contains(t, n.Version, tork.Version)
 		heartbeats = heartbeats + 1
 		return nil

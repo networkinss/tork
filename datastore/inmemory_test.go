@@ -3,6 +3,8 @@ package datastore_test
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,10 +89,118 @@ func TestInMemoryUpdateTask(t *testing.T) {
 	assert.Equal(t, tork.TaskStateScheduled, t2.State)
 }
 
+func TestInMemoryUpdateTaskConcurrently(t *testing.T) {
+	ctx := context.Background()
+	ds := datastore.NewInMemoryDatastore()
+
+	now := time.Now().UTC()
+	j1 := tork.Job{
+		ID: uuid.NewUUID(),
+	}
+	err := ds.CreateJob(ctx, &j1)
+	assert.NoError(t, err)
+	t1 := &tork.Task{
+		ID:        uuid.NewUUID(),
+		CreatedAt: &now,
+		JobID:     j1.ID,
+		Parallel:  &tork.ParallelTask{},
+		Env:       make(map[string]string),
+	}
+	err = ds.CreateTask(ctx, t1)
+	assert.NoError(t, err)
+
+	w := sync.WaitGroup{}
+	w.Add(1000)
+	for i := 0; i < 1000; i++ {
+		go func() {
+			defer w.Done()
+			err := ds.UpdateTask(ctx, t1.ID, func(u *tork.Task) error {
+				time.Sleep(time.Duration(rand.Intn(1000)) * time.Microsecond)
+				u.State = tork.TaskStateScheduled
+				u.Result = "my result"
+				u.Parallel.Completions = u.Parallel.Completions + 1
+				u.Env[fmt.Sprintf("SOME_VAR_%d", rand.Intn(100000))] = "some value"
+				return nil
+			})
+			assert.NoError(t, err)
+		}()
+	}
+
+	r := sync.WaitGroup{}
+	r.Add(1000)
+	for i := 0; i < 1000; i++ {
+		go func() {
+			defer r.Done()
+			time.Sleep(time.Duration(rand.Intn(1000)) * time.Microsecond)
+			t2, err := ds.GetTaskByID(ctx, t1.ID)
+			assert.NoError(t, err)
+			_ = t2.Clone()
+		}()
+	}
+
+	r.Wait()
+	w.Wait()
+
+	t2, err := ds.GetTaskByID(ctx, t1.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, tork.TaskStateScheduled, t2.State)
+	assert.Equal(t, "my result", t2.Result)
+	assert.Equal(t, 1000, t2.Parallel.Completions)
+}
+
+func TestInMemoryUpdateJobConcurrently(t *testing.T) {
+	ctx := context.Background()
+	ds := datastore.NewInMemoryDatastore()
+
+	j1 := tork.Job{
+		ID:        uuid.NewUUID(),
+		TaskCount: 0,
+	}
+	err := ds.CreateJob(ctx, &j1)
+	assert.NoError(t, err)
+
+	w := sync.WaitGroup{}
+	w.Add(1000)
+	for i := 0; i < 1000; i++ {
+		go func() {
+			defer w.Done()
+			err := ds.UpdateJob(ctx, j1.ID, func(u *tork.Job) error {
+				time.Sleep(time.Duration(rand.Intn(1000)) * time.Microsecond)
+				u.TaskCount = u.TaskCount + 1
+				if u.Context.Tasks == nil {
+					u.Context.Tasks = make(map[string]string)
+				}
+				u.Context.Tasks[fmt.Sprintf("someVar-%d", rand.Intn(100000))] = "some value"
+				return nil
+			})
+			assert.NoError(t, err)
+		}()
+	}
+
+	r := sync.WaitGroup{}
+	r.Add(1000)
+	for i := 0; i < 1000; i++ {
+		go func() {
+			defer r.Done()
+			time.Sleep(time.Duration(rand.Intn(1000)) * time.Microsecond)
+			j2, err := ds.GetJobByID(ctx, j1.ID)
+			assert.NoError(t, err)
+			_ = j2.Clone()
+		}()
+	}
+	r.Wait()
+
+	w.Wait()
+
+	j2, err := ds.GetJobByID(ctx, j1.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1000, j2.TaskCount)
+}
+
 func TestInMemoryCreateAndGetNode(t *testing.T) {
 	ctx := context.Background()
 	ds := datastore.NewInMemoryDatastore()
-	n1 := tork.Node{
+	n1 := &tork.Node{
 		ID: uuid.NewUUID(),
 	}
 	err := ds.CreateNode(ctx, n1)
@@ -103,7 +213,7 @@ func TestInMemoryCreateAndGetNode(t *testing.T) {
 func TestInMemoryUpdateNode(t *testing.T) {
 	ctx := context.Background()
 	ds := datastore.NewInMemoryDatastore()
-	n1 := tork.Node{
+	n1 := &tork.Node{
 		ID:              uuid.NewUUID(),
 		LastHeartbeatAt: time.Now().UTC().Add(-time.Minute),
 	}
@@ -123,196 +233,125 @@ func TestInMemoryUpdateNode(t *testing.T) {
 	assert.Equal(t, now, n2.LastHeartbeatAt)
 }
 
-func TestInMemoryGetActiveNodes(t *testing.T) {
+func TestInMemoryUpdateNodeConcurrently(t *testing.T) {
 	ctx := context.Background()
 	ds := datastore.NewInMemoryDatastore()
-	n1 := tork.Node{
+	n1 := &tork.Node{
 		ID:              uuid.NewUUID(),
-		Status:          tork.NodeStatusUP,
-		LastHeartbeatAt: time.Now().UTC().Add(-time.Second * 20),
-	}
-	n2 := tork.Node{
-		ID:              uuid.NewUUID(),
-		Status:          tork.NodeStatusUP,
-		LastHeartbeatAt: time.Now().UTC().Add(-time.Minute * 4),
-	}
-	n3 := tork.Node{ // inactive
-		ID:              uuid.NewUUID(),
-		Status:          tork.NodeStatusUP,
-		LastHeartbeatAt: time.Now().UTC().Add(-time.Minute * 10),
+		LastHeartbeatAt: time.Now().UTC().Add(-time.Minute),
 	}
 	err := ds.CreateNode(ctx, n1)
 	assert.NoError(t, err)
 
-	err = ds.CreateNode(ctx, n2)
-	assert.NoError(t, err)
+	w := sync.WaitGroup{}
+	w.Add(1000)
+	for i := 0; i < 1000; i++ {
+		go func() {
+			defer w.Done()
+			err := ds.UpdateNode(ctx, n1.ID, func(u *tork.Node) error {
+				time.Sleep(time.Duration(rand.Intn(1000)) * time.Microsecond)
+				u.TaskCount = u.TaskCount + 1
+				return nil
+			})
+			assert.NoError(t, err)
+		}()
+	}
 
-	err = ds.CreateNode(ctx, n3)
-	assert.NoError(t, err)
+	r := sync.WaitGroup{}
+	r.Add(1000)
+	for i := 0; i < 1000; i++ {
+		go func() {
+			defer r.Done()
+			time.Sleep(time.Duration(rand.Intn(1000)) * time.Microsecond)
+			n2, err := ds.GetNodeByID(ctx, n1.ID)
+			assert.NoError(t, err)
+			_ = n2.Clone()
+		}()
+	}
 
-	ns, err := ds.GetActiveNodes(ctx)
+	r.Wait()
+	w.Wait()
+
+	n2, err := ds.GetNodeByID(ctx, n1.ID)
 	assert.NoError(t, err)
-	assert.Equal(t, 2, len(ns))
-	assert.Equal(t, tork.NodeStatusUP, ns[0].Status)
-	assert.Equal(t, tork.NodeStatusOffline, ns[1].Status)
+	assert.Equal(t, 1000, n2.TaskCount)
 }
 
-func TestInMemoryCreateAndGetJob(t *testing.T) {
+func TestInMemoryExpiredNodes(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
-	j1 := tork.Job{
+	ds := datastore.NewInMemoryDatastore(
+		datastore.WithCleanupInterval(time.Millisecond*20),
+		datastore.WithNodeExpiration(time.Millisecond*10),
+	)
+	n := &tork.Node{
 		ID: uuid.NewUUID(),
 	}
-	err := ds.CreateJob(ctx, &j1)
+	err := ds.CreateNode(ctx, n)
 	assert.NoError(t, err)
-	j2, err := ds.GetJobByID(ctx, j1.ID)
+	n1, err := ds.GetNodeByID(ctx, n.ID)
 	assert.NoError(t, err)
-	assert.Equal(t, j1.ID, j2.ID)
+	assert.Equal(t, n.ID, n1.ID)
+	time.Sleep(time.Millisecond * 100)
+	_, err = ds.GetNodeByID(ctx, n.ID)
+	assert.ErrorIs(t, err, datastore.ErrNodeNotFound)
 }
 
-func TestInMemoryGetJobs(t *testing.T) {
+func TestInMemoryExpiredJob(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
-	for i := 0; i < 101; i++ {
-		now := time.Now().UTC()
-		j1 := tork.Job{
-			ID:        uuid.NewUUID(),
-			Name:      fmt.Sprintf("Job %d", (i + 1)),
-			CreatedAt: now,
-			State:     tork.JobStateRunning,
-			Tasks: []*tork.Task{
-				{
-					Name: "some task",
-				},
-			},
-		}
-		err := ds.CreateJob(ctx, &j1)
-		assert.NoError(t, err)
-
-		err = ds.CreateTask(ctx, &tork.Task{
-			ID:    uuid.NewUUID(),
-			JobID: j1.ID,
-			State: tork.TaskStateRunning,
-		})
-		assert.NoError(t, err)
-		time.Sleep(time.Millisecond)
-	}
-	p1, err := ds.GetJobs(ctx, "", 1, 10)
-	assert.NoError(t, err)
-	assert.Equal(t, 10, p1.Size)
-	assert.Equal(t, "Job 101", p1.Items[0].Name)
-	assert.Empty(t, p1.Items[0].Tasks)
-	assert.Empty(t, p1.Items[0].Execution)
-
-	p2, err := ds.GetJobs(ctx, "", 2, 10)
-	assert.NoError(t, err)
-	assert.Equal(t, 10, p2.Size)
-
-	p10, err := ds.GetJobs(ctx, "", 10, 10)
-	assert.NoError(t, err)
-	assert.Equal(t, 10, p10.Size)
-
-	p11, err := ds.GetJobs(ctx, "", 11, 10)
-	assert.NoError(t, err)
-	assert.Equal(t, 1, p11.Size)
-	assert.NotEqual(t, p2.Items[0].ID, p1.Items[9].ID)
-	assert.Equal(t, 101, p1.TotalItems)
-
-	ps1, err := ds.GetJobs(ctx, "Job", 1, 10)
-	assert.NoError(t, err)
-	assert.Equal(t, 10, ps1.Size)
-	assert.Equal(t, 101, ps1.TotalItems)
-
-	ps1, err = ds.GetJobs(ctx, "101", 1, 10)
-	assert.NoError(t, err)
-	assert.Equal(t, 1, ps1.Size)
-	assert.Equal(t, 1, ps1.TotalItems)
-
-	ps1, err = ds.GetJobs(ctx, "running", 1, 10)
-	assert.NoError(t, err)
-	assert.Equal(t, 10, ps1.Size)
-	assert.Equal(t, 101, ps1.TotalItems)
-}
-
-func TestInMemoryUpdateJob(t *testing.T) {
-	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
-	j1 := tork.Job{
+	ds := datastore.NewInMemoryDatastore(
+		datastore.WithCleanupInterval(time.Millisecond*20),
+		datastore.WithJobExpiration(time.Millisecond*10),
+	)
+	j := &tork.Job{
 		ID:    uuid.NewUUID(),
-		State: tork.JobStatePending,
-		Context: tork.JobContext{
-			Inputs: map[string]string{
-				"var1": "val1",
-			},
-		},
+		Name:  "test job",
+		State: tork.JobStateRunning,
 	}
-	err := ds.CreateJob(ctx, &j1)
+	err := ds.CreateJob(ctx, j)
 	assert.NoError(t, err)
-	err = ds.UpdateJob(ctx, j1.ID, func(u *tork.Job) error {
+
+	ta := &tork.Task{
+		ID:    uuid.NewUUID(),
+		Name:  "test task",
+		JobID: j.ID,
+	}
+	err = ds.CreateTask(ctx, ta)
+	assert.NoError(t, err)
+
+	j1, err := ds.GetJobByID(ctx, j.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, j.ID, j1.ID)
+
+	t1, err := ds.GetTaskByID(ctx, ta.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, ta.ID, t1.ID)
+
+	time.Sleep(time.Millisecond * 100)
+
+	// should not be evicted yet --
+	// as the job is still running
+	j1, err = ds.GetJobByID(ctx, j.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, j.ID, j1.ID)
+
+	t1, err = ds.GetTaskByID(ctx, ta.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, ta.ID, t1.ID)
+
+	// completing the job
+	err = ds.UpdateJob(ctx, j.ID, func(u *tork.Job) error {
 		u.State = tork.JobStateCompleted
-		u.Context.Inputs["var2"] = "val2"
 		return nil
 	})
 	assert.NoError(t, err)
-	j2, err := ds.GetJobByID(ctx, j1.ID)
-	assert.NoError(t, err)
-	assert.Equal(t, tork.JobStateCompleted, j2.State)
-	assert.Equal(t, "val1", j2.Context.Inputs["var1"])
-	assert.Equal(t, "val2", j2.Context.Inputs["var2"])
-}
 
-func TestInMemoryGetStats(t *testing.T) {
-	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
+	time.Sleep(time.Second * 1)
 
-	s, err := ds.GetStats(ctx)
-	assert.NoError(t, err)
-	assert.Equal(t, 0, s.Jobs.Running)
-	assert.Equal(t, 0, s.Tasks.Running)
-	assert.Equal(t, float64(0), s.Nodes.CPUPercent)
-	assert.Equal(t, 0, s.Nodes.Running)
+	// should be evicted now
+	_, err = ds.GetJobByID(ctx, j.ID)
+	assert.ErrorIs(t, err, datastore.ErrJobNotFound)
 
-	for i := 0; i < 100; i++ {
-		var state tork.JobState
-		if i%2 == 0 {
-			state = tork.JobStateRunning
-		} else {
-			state = tork.JobStatePending
-		}
-		err := ds.CreateJob(ctx, &tork.Job{
-			ID:    uuid.NewUUID(),
-			State: state,
-		})
-		assert.NoError(t, err)
-	}
-
-	for i := 0; i < 100; i++ {
-		var state tork.TaskState
-		if i%2 == 0 {
-			state = tork.TaskStateRunning
-		} else {
-			state = tork.TaskStatePending
-		}
-		err := ds.CreateTask(ctx, &tork.Task{
-			ID:    uuid.NewUUID(),
-			State: state,
-		})
-		assert.NoError(t, err)
-	}
-
-	for i := 0; i < 10; i++ {
-		err := ds.CreateNode(ctx, tork.Node{
-			ID:              uuid.NewUUID(),
-			LastHeartbeatAt: time.Now().UTC().Add(-time.Minute * time.Duration(i)),
-			CPUPercent:      float64(i * 10),
-		})
-		assert.NoError(t, err)
-	}
-
-	s, err = ds.GetStats(ctx)
-	assert.NoError(t, err)
-	assert.Equal(t, 50, s.Jobs.Running)
-	assert.Equal(t, 50, s.Tasks.Running)
-	assert.Equal(t, float64(20), s.Nodes.CPUPercent)
-	assert.Equal(t, 5, s.Nodes.Running)
+	_, err = ds.GetTaskByID(ctx, ta.ID)
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, datastore.ErrTaskNotFound)
 }

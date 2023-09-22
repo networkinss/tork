@@ -5,12 +5,15 @@ import (
 
 	"github.com/runabol/tork/engine"
 	"github.com/runabol/tork/internal/logging"
+	"github.com/runabol/tork/middleware/job"
+	"github.com/runabol/tork/middleware/node"
+	"github.com/runabol/tork/middleware/task"
+	"github.com/runabol/tork/middleware/web"
 	ucli "github.com/urfave/cli/v2"
 )
 
 type CLI struct {
-	app         *ucli.App
-	configurers []func(eng *engine.Engine) error
+	app *ucli.App
 }
 
 func New() *CLI {
@@ -18,14 +21,32 @@ func New() *CLI {
 		Name:  "tork",
 		Usage: "a distributed workflow engine",
 	}
-	c := &CLI{app: app}
+	c := &CLI{
+		app: app,
+	}
 	app.Before = c.before
 	app.Commands = c.commands()
 	return c
 }
 
-func (c *CLI) ConfigureEngine(cust func(eng *engine.Engine) error) {
-	c.configurers = append(c.configurers, cust)
+func (c *CLI) RegisterWebMiddleware(mw web.MiddlewareFunc) {
+	engine.RegisterWebMiddleware(mw)
+}
+
+func (c *CLI) RegisterTaskMiddleware(mw task.MiddlewareFunc) {
+	engine.RegisterTaskMiddleware(mw)
+}
+
+func (c *CLI) RegisterJobMiddleware(mw job.MiddlewareFunc) {
+	engine.RegisterJobMiddleware(mw)
+}
+
+func (c *CLI) RegisterNodeMiddleware(mw node.MiddlewareFunc) {
+	engine.RegisterNodeMiddleware(mw)
+}
+
+func (c *CLI) RegisterEndpoint(method, path string, handler web.HandlerFunc) {
+	engine.RegisterEndpoint(method, path, handler)
 }
 
 func (c *CLI) Run() error {

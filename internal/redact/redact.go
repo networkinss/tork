@@ -6,6 +6,10 @@ import (
 	"github.com/runabol/tork"
 )
 
+const (
+	redactedStr = "[REDACTED]"
+)
+
 type matcher func(string) bool
 
 var matchers = []matcher{
@@ -38,19 +42,15 @@ func Task(t *tork.Task) *tork.Task {
 			redacted.Parallel.Tasks[i] = Task(p)
 		}
 	}
+	// registry creds
+	if redacted.Registry != nil {
+		redacted.Registry.Password = redactedStr
+	}
 	return redacted
 }
 
-func Jobs(js []*tork.Job) []*tork.Job {
-	result := make([]*tork.Job, len(js))
-	for i, j := range js {
-		result[i] = Job(j)
-	}
-	return result
-}
-
-func Job(j *tork.Job) *tork.Job {
-	redacted := j.Clone()
+func Job(j *tork.Job) {
+	redacted := j
 	// redact inputs
 	redacted.Inputs = redactVars(redacted.Inputs)
 	// redact context
@@ -64,7 +64,6 @@ func Job(j *tork.Job) *tork.Job {
 	for i, t := range redacted.Execution {
 		redacted.Execution[i] = Task(t)
 	}
-	return redacted
 }
 
 func redactVars(m map[string]string) map[string]string {
@@ -72,7 +71,7 @@ func redactVars(m map[string]string) map[string]string {
 	for k, v := range m {
 		for _, m := range matchers {
 			if m(k) {
-				v = "[REDACTED]"
+				v = redactedStr
 				break
 			}
 		}

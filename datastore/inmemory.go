@@ -10,26 +10,68 @@ import (
 	"github.com/pkg/errors"
 	"github.com/runabol/tork"
 
-	"github.com/runabol/tork/internal/syncx"
+	"github.com/runabol/tork/internal/cache"
 )
 
-var ErrTaskNotFound = errors.New("task not found")
-var ErrNodeNotFound = errors.New("node not found")
-var ErrJobNotFound = errors.New("job not found")
-var ErrContextNotFound = errors.New("context not found")
+var (
+	ErrTaskNotFound    = errors.New("task not found")
+	ErrNodeNotFound    = errors.New("node not found")
+	ErrJobNotFound     = errors.New("job not found")
+	ErrContextNotFound = errors.New("context not found")
+)
+
+const (
+	defaultNodeExpiration  = time.Minute * 10
+	defaultCleanupInterval = time.Minute * 10
+	defaultJobExpiration   = time.Hour
+)
 
 type InMemoryDatastore struct {
-	tasks *syncx.Map[string, *tork.Task]
-	nodes *syncx.Map[string, tork.Node]
-	jobs  *syncx.Map[string, *tork.Job]
+	tasks           *cache.Cache[*tork.Task]
+	nodes           *cache.Cache[*tork.Node]
+	jobs            *cache.Cache[*tork.Job]
+	nodeExpiration  *time.Duration
+	jobExpiration   *time.Duration
+	cleanupInterval *time.Duration
 }
 
-func NewInMemoryDatastore() *InMemoryDatastore {
-	return &InMemoryDatastore{
-		tasks: new(syncx.Map[string, *tork.Task]),
-		nodes: new(syncx.Map[string, tork.Node]),
-		jobs:  new(syncx.Map[string, *tork.Job]),
+type Option = func(ds *InMemoryDatastore)
+
+func WithNodeExpiration(exp time.Duration) Option {
+	return func(ds *InMemoryDatastore) {
+		ds.nodeExpiration = &exp
 	}
+}
+
+func WithJobExpiration(exp time.Duration) Option {
+	return func(ds *InMemoryDatastore) {
+		ds.jobExpiration = &exp
+	}
+}
+func WithCleanupInterval(ci time.Duration) Option {
+	return func(ds *InMemoryDatastore) {
+		ds.cleanupInterval = &ci
+	}
+}
+
+func NewInMemoryDatastore(opts ...Option) *InMemoryDatastore {
+	ds := &InMemoryDatastore{}
+	for _, opt := range opts {
+		opt(ds)
+	}
+	ci := defaultCleanupInterval
+	if ds.cleanupInterval != nil {
+		ci = *ds.cleanupInterval
+	}
+	ds.tasks = cache.New[*tork.Task](cache.NoExpiration, ci)
+	nodeExp := defaultNodeExpiration
+	if ds.nodeExpiration != nil {
+		nodeExp = *ds.nodeExpiration
+	}
+	ds.nodes = cache.New[*tork.Node](nodeExp, ci)
+	ds.jobs = cache.New[*tork.Job](cache.NoExpiration, ci)
+	ds.jobs.OnEvicted(ds.onJobEviction)
+	return ds
 }
 
 func (ds *InMemoryDatastore) CreateTask(ctx context.Context, t *tork.Task) error {
@@ -49,56 +91,61 @@ func (ds *InMemoryDatastore) GetTaskByID(ctx context.Context, id string) (*tork.
 }
 
 func (ds *InMemoryDatastore) UpdateTask(ctx context.Context, id string, modify func(u *tork.Task) error) error {
-	t, ok := ds.tasks.Get(id)
+	_, ok := ds.tasks.Get(id)
 	if !ok {
 		return ErrTaskNotFound
 	}
-	if err := modify(t); err != nil {
-		return err
-	}
-	return nil
+	return ds.tasks.Modify(id, func(t *tork.Task) (*tork.Task, error) {
+		update := t.Clone()
+		if err := modify(update); err != nil {
+			return nil, errors.Wrapf(err, "error modifying task %s", id)
+		}
+		return update, nil
+	})
 }
 
-func (ds *InMemoryDatastore) CreateNode(ctx context.Context, n tork.Node) error {
+func (ds *InMemoryDatastore) CreateNode(ctx context.Context, n *tork.Node) error {
 	_, ok := ds.nodes.Get(n.ID)
 	if ok {
 		return errors.Errorf("node %s already exists", n.ID)
 	}
-	ds.nodes.Set(n.ID, n)
+	ds.nodes.Set(n.ID, n.Clone())
 	return nil
 }
 
 func (ds *InMemoryDatastore) UpdateNode(ctx context.Context, id string, modify func(u *tork.Node) error) error {
-	n, ok := ds.nodes.Get(id)
+	_, ok := ds.nodes.Get(id)
 	if !ok {
 		return ErrNodeNotFound
 	}
-	if err := modify(&n); err != nil {
-		return err
-	}
-	ds.nodes.Set(n.ID, n)
-	return nil
+	return ds.nodes.Modify(id, func(n *tork.Node) (*tork.Node, error) {
+		update := n.Clone()
+		if err := modify(update); err != nil {
+			return nil, errors.Wrapf(err, "error modifying node %s", id)
+		}
+		return update, nil
+	})
 }
 
-func (ds *InMemoryDatastore) GetNodeByID(ctx context.Context, id string) (tork.Node, error) {
+func (ds *InMemoryDatastore) GetNodeByID(ctx context.Context, id string) (*tork.Node, error) {
 	n, ok := ds.nodes.Get(id)
 	if !ok {
-		return tork.Node{}, ErrNodeNotFound
+		return nil, ErrNodeNotFound
 	}
-	return n, nil
+	return n.Clone(), nil
 }
 
-func (ds *InMemoryDatastore) GetActiveNodes(ctx context.Context) ([]tork.Node, error) {
-	nodes := make([]tork.Node, 0)
+func (ds *InMemoryDatastore) GetActiveNodes(ctx context.Context) ([]*tork.Node, error) {
+	nodes := make([]*tork.Node, 0)
 	timeout := time.Now().UTC().Add(-tork.LAST_HEARTBEAT_TIMEOUT)
-	ds.nodes.Iterate(func(_ string, n tork.Node) {
+	ds.nodes.Iterate(func(_ string, n *tork.Node) {
 		if n.LastHeartbeatAt.After(timeout) {
 			// if we hadn't seen an heartbeat for two or more
 			// consecutive periods we consider the node as offline
 			if n.LastHeartbeatAt.Before(time.Now().UTC().Add(-tork.HEARTBEAT_RATE * 2)) {
 				n.Status = tork.NodeStatusOffline
 			}
-			nodes = append(nodes, n)
+			nodes = append(nodes, n.Clone())
 		}
 	})
 	sort.Slice(nodes, func(i, j int) bool {
@@ -113,14 +160,38 @@ func (ds *InMemoryDatastore) CreateJob(ctx context.Context, j *tork.Job) error {
 }
 
 func (ds *InMemoryDatastore) UpdateJob(ctx context.Context, id string, modify func(u *tork.Job) error) error {
+	_, ok := ds.jobs.Get(id)
+	if !ok {
+		return ErrJobNotFound
+	}
+
+	err := ds.jobs.Modify(id, func(j *tork.Job) (*tork.Job, error) {
+		update := j.Clone()
+		if err := modify(update); err != nil {
+			return nil, errors.Wrapf(err, "error modifying job %s", id)
+		}
+		return update, nil
+	})
+
+	if err != nil {
+		return err
+	}
+
 	j, ok := ds.jobs.Get(id)
 	if !ok {
 		return ErrJobNotFound
 	}
-	if err := modify(j); err != nil {
-		return err
+
+	if j.State == tork.JobStateCompleted || j.State == tork.JobStateFailed {
+		exp := defaultJobExpiration
+		if ds.jobExpiration != nil {
+			exp = *ds.jobExpiration
+		}
+		if err := ds.jobs.SetExpiration(j.ID, exp); err != nil {
+			return errors.Wrap(err, "error modifying job expiration")
+		}
 	}
-	ds.jobs.Set(j.ID, j)
+
 	return nil
 }
 
@@ -139,6 +210,7 @@ func (ds *InMemoryDatastore) GetJobByID(ctx context.Context, id string) (*tork.J
 	if !ok {
 		return nil, ErrJobNotFound
 	}
+	j = j.Clone()
 	execution := ds.getExecution(id)
 	sort.Slice(execution, func(i, j int) bool {
 		posi := execution[i].Position
@@ -170,7 +242,7 @@ func (ds *InMemoryDatastore) GetActiveTasks(ctx context.Context, jobID string) (
 	return result, nil
 }
 
-func (ds *InMemoryDatastore) GetJobs(ctx context.Context, q string, page, size int) (*Page[*tork.Job], error) {
+func (ds *InMemoryDatastore) GetJobs(ctx context.Context, q string, page, size int) (*Page[*tork.JobSummary], error) {
 	offset := (page - 1) * size
 	filtered := make([]*tork.Job, 0)
 	ds.jobs.Iterate(func(_ string, j *tork.Job) {
@@ -182,19 +254,16 @@ func (ds *InMemoryDatastore) GetJobs(ctx context.Context, q string, page, size i
 	sort.Slice(filtered, func(i, j int) bool {
 		return filtered[i].CreatedAt.After(filtered[j].CreatedAt)
 	})
-	result := make([]*tork.Job, 0)
+	result := make([]*tork.JobSummary, 0)
 	for i := offset; i < (offset+size) && i < len(filtered); i++ {
 		j := filtered[i]
-		jc := j.Clone()
-		jc.Tasks = make([]*tork.Task, 0)
-		jc.Execution = make([]*tork.Task, 0)
-		result = append(result, jc)
+		result = append(result, tork.NewJobSummary(j))
 	}
 	totalPages := len(filtered) / size
 	if len(filtered)%size != 0 {
 		totalPages = totalPages + 1
 	}
-	return &Page[*tork.Job]{
+	return &Page[*tork.JobSummary]{
 		Items:      result,
 		Number:     page,
 		Size:       len(result),
@@ -203,8 +272,8 @@ func (ds *InMemoryDatastore) GetJobs(ctx context.Context, q string, page, size i
 	}, nil
 }
 
-func (ds *InMemoryDatastore) GetStats(ctx context.Context) (*tork.Stats, error) {
-	s := &tork.Stats{}
+func (ds *InMemoryDatastore) GetMetrics(ctx context.Context) (*tork.Metrics, error) {
+	s := &tork.Metrics{}
 
 	ds.jobs.Iterate(func(_ string, j *tork.Job) {
 		if j.State == tork.JobStateRunning {
@@ -218,7 +287,7 @@ func (ds *InMemoryDatastore) GetStats(ctx context.Context) (*tork.Stats, error) 
 		}
 	})
 
-	ds.nodes.Iterate(func(_ string, n tork.Node) {
+	ds.nodes.Iterate(func(_ string, n *tork.Node) {
 		if n.LastHeartbeatAt.After(time.Now().UTC().Add(-(time.Minute * 5))) {
 			s.Nodes.Running = s.Nodes.Running + 1
 			s.Nodes.CPUPercent = s.Nodes.CPUPercent + n.CPUPercent
@@ -234,4 +303,20 @@ func (ds *InMemoryDatastore) GetStats(ctx context.Context) (*tork.Stats, error) 
 
 func (ds *InMemoryDatastore) WithTx(ctx context.Context, f func(tx Datastore) error) error {
 	return f(ds)
+}
+
+func (ds *InMemoryDatastore) onJobEviction(s string, job *tork.Job) {
+	tasks := make([]*tork.Task, 0)
+	ds.tasks.Iterate(func(_ string, t *tork.Task) {
+		if t.JobID == job.ID {
+			tasks = append(tasks, t.Clone())
+		}
+	})
+	for _, task := range tasks {
+		ds.tasks.Delete(task.ID)
+	}
+}
+
+func (ds *InMemoryDatastore) HealthCheck(ctx context.Context) error {
+	return nil
 }

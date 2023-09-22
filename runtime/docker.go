@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
@@ -36,8 +38,14 @@ type printableReader struct {
 }
 
 type pullRequest struct {
-	image string
-	done  chan error
+	image    string
+	registry registry
+	done     chan error
+}
+
+type registry struct {
+	username string
+	password string
 }
 
 func (r printableReader) Read(p []byte) (int, error) {
@@ -100,6 +108,12 @@ func (d *DockerRuntime) imagePull(ctx context.Context, t *tork.Task) error {
 		image: t.Image,
 		done:  make(chan error),
 	}
+	if t.Registry != nil {
+		pr.registry = registry{
+			username: t.Registry.Username,
+			password: t.Registry.Password,
+		}
+	}
 	d.pullq <- pr
 	return <-pr.done
 }
@@ -108,16 +122,26 @@ func (d *DockerRuntime) imagePull(ctx context.Context, t *tork.Task) error {
 // to pull images from the docker repo
 func (d *DockerRuntime) puller(ctx context.Context) {
 	for pr := range d.pullq {
-		reader, err := d.client.ImagePull(
-			ctx, pr.image, types.ImagePullOptions{})
+		authConfig := types.AuthConfig{
+			Username: pr.registry.username,
+			Password: pr.registry.password,
+		}
+		encodedJSON, err := json.Marshal(authConfig)
 		if err != nil {
 			pr.done <- err
-			return
+			continue
+		}
+		authStr := base64.URLEncoding.EncodeToString(encodedJSON)
+		reader, err := d.client.ImagePull(
+			ctx, pr.image, types.ImagePullOptions{RegistryAuth: authStr})
+		if err != nil {
+			pr.done <- err
+			continue
 		}
 		_, err = io.Copy(os.Stdout, reader)
 		if err != nil {
 			pr.done <- err
-			return
+			continue
 		}
 		pr.done <- nil
 	}
@@ -128,7 +152,7 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 		return errors.New("task id is required")
 	}
 	if err := d.imagePull(ctx, t); err != nil {
-		return errors.Wrapf(err, "error pulling image")
+		return errors.Wrapf(err, "error pulling image: %s", t.Image)
 	}
 
 	env := []string{}
@@ -138,25 +162,31 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 
 	var mounts []mount.Mount
 
-	for _, v := range t.Volumes {
-		vol := strings.Split(v, ":")
-		if len(vol) != 3 {
-			return errors.Errorf("invalid volume %s", v)
-		}
+	for _, m := range t.Mounts {
 		var mt mount.Type
-		switch vol[0] {
-		case "volume":
+		switch m.Type {
+		case tork.MountTypeVolume:
 			mt = mount.TypeVolume
-		case "bind":
+			if m.Target == "" {
+				return errors.Errorf("volume target is required")
+			}
+		case tork.MountTypeBind:
 			mt = mount.TypeBind
+			if m.Target == "" {
+				return errors.Errorf("bind target is required")
+			}
+			if m.Source == "" {
+				return errors.Errorf("bind source is required")
+			}
 		default:
-			return errors.Errorf("unknown volume type: %s", vol[0])
+			return errors.Errorf("unknown volume type: %s", m.Type)
 		}
 		mount := mount.Mount{
 			Type:   mt,
-			Source: vol[1],
-			Target: vol[2],
+			Source: m.Source,
+			Target: m.Target,
 		}
+		log.Debug().Msgf("Mounting %s -> %s", mount.Source, mount.Target)
 		mounts = append(mounts, mount)
 	}
 
@@ -297,7 +327,7 @@ func (d *DockerRuntime) Stop(ctx context.Context, t *tork.Task) error {
 	d.tasks.Delete(t.ID)
 	log.Printf("Attempting to stop and remove container %v", containerID)
 	return d.client.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{
-		RemoveVolumes: false,
+		RemoveVolumes: true,
 		RemoveLinks:   false,
 		Force:         true,
 	})

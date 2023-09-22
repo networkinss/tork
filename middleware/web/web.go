@@ -1,10 +1,9 @@
-package middleware
+package web
 
 import (
 	"net/http"
 
 	"github.com/runabol/tork"
-	"github.com/runabol/tork/input"
 )
 
 type MiddlewareFunc func(next HandlerFunc) HandlerFunc
@@ -16,6 +15,15 @@ type JobListener func(j *tork.Job)
 type Context interface {
 	// Request returns `*http.Request`.
 	Request() *http.Request
+
+	// Get retrieves data from the context.
+	Get(key string) any
+
+	// Response returns `http.ResponseWriter`.
+	Response() http.ResponseWriter
+
+	// NoContent sends a response with no body and a status code.
+	NoContent(code int) error
 
 	// String sends a string response with status code.
 	String(code int, s string) error
@@ -29,9 +37,6 @@ type Context interface {
 
 	// Error sends an error back to the client.
 	Error(code int, err error)
-
-	// SubmitJob submits a job input for processing
-	SubmitJob(j *input.Job, listeners ...JobListener) (*tork.Job, error)
 
 	// Done returns a channel that's closed when work done on behalf of this
 	// context should be canceled.

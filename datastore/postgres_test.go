@@ -34,6 +34,7 @@ func TestPostgresCreateAndGetTask(t *testing.T) {
 		Description: "some description",
 		Networks:    []string{"some-network"},
 		Files:       map[string]string{"myfile": "hello world"},
+		Registry:    &tork.Registry{Username: "me", Password: "secret"},
 	}
 	err = ds.CreateTask(ctx, &t1)
 	assert.NoError(t, err)
@@ -43,6 +44,8 @@ func TestPostgresCreateAndGetTask(t *testing.T) {
 	assert.Equal(t, t1.Description, t2.Description)
 	assert.Equal(t, []string([]string{"some-network"}), t2.Networks)
 	assert.Equal(t, map[string]string{"myfile": "hello world"}, t2.Files)
+	assert.Equal(t, "me", t2.Registry.Username)
+	assert.Equal(t, "secret", t2.Registry.Password)
 }
 
 func TestPostgresCreateTaskBadOutput(t *testing.T) {
@@ -187,7 +190,7 @@ func TestPostgresUpdateTaskConcurrently(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		go func() {
 			defer wg.Done()
-			err = ds.UpdateTask(ctx, t1.ID, func(u *tork.Task) error {
+			err := ds.UpdateTask(ctx, t1.ID, func(u *tork.Task) error {
 				u.State = tork.TaskStateScheduled
 				u.Result = "my result"
 				u.Parallel.Completions = u.Parallel.Completions + 1
@@ -243,7 +246,7 @@ func TestPostgresCreateAndGetNode(t *testing.T) {
 	dsn := "host=localhost user=tork password=tork dbname=tork port=5432 sslmode=disable"
 	ds, err := NewPostgresDataStore(dsn)
 	assert.NoError(t, err)
-	n1 := tork.Node{
+	n1 := &tork.Node{
 		ID:       uuid.NewUUID(),
 		Hostname: "some-name",
 		Version:  "1.0.0",
@@ -263,7 +266,7 @@ func TestPostgresUpdateNode(t *testing.T) {
 	ds, err := NewPostgresDataStore(dsn)
 	assert.NoError(t, err)
 
-	n1 := tork.Node{
+	n1 := &tork.Node{
 		ID:              uuid.NewUUID(),
 		LastHeartbeatAt: time.Now().UTC().Add(-time.Minute),
 	}
@@ -293,7 +296,7 @@ func TestPostgresUpdateNodeConcurrently(t *testing.T) {
 	ds, err := NewPostgresDataStore(dsn)
 	assert.NoError(t, err)
 
-	n1 := tork.Node{
+	n1 := &tork.Node{
 		ID:              uuid.NewUUID(),
 		LastHeartbeatAt: time.Now().UTC().Add(-time.Minute),
 	}
@@ -307,7 +310,7 @@ func TestPostgresUpdateNodeConcurrently(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		go func() {
 			defer wg.Done()
-			err = ds.UpdateNode(ctx, n1.ID, func(u *tork.Node) error {
+			err := ds.UpdateNode(ctx, n1.ID, func(u *tork.Node) error {
 				u.LastHeartbeatAt = now
 				u.CPUPercent = u.CPUPercent + 1
 				return nil
@@ -339,17 +342,17 @@ func TestPostgresGetActiveNodes(t *testing.T) {
 	}()
 	err = ds.ExecScript(postgres.SCHEMA)
 	assert.NoError(t, err)
-	n1 := tork.Node{
+	n1 := &tork.Node{
 		ID:              uuid.NewUUID(),
 		Status:          tork.NodeStatusUP,
 		LastHeartbeatAt: time.Now().UTC().Add(-time.Second * 20),
 	}
-	n2 := tork.Node{
+	n2 := &tork.Node{
 		ID:              uuid.NewUUID(),
 		Status:          tork.NodeStatusUP,
 		LastHeartbeatAt: time.Now().UTC().Add(-time.Minute * 4),
 	}
-	n3 := tork.Node{ // inactive
+	n3 := &tork.Node{ // inactive
 		ID:              uuid.NewUUID(),
 		Status:          tork.NodeStatusUP,
 		LastHeartbeatAt: time.Now().UTC().Add(-time.Minute * 10),
@@ -380,6 +383,16 @@ func TestPostgresCreateAndGetJob(t *testing.T) {
 		Inputs: map[string]string{
 			"var1": "val1",
 		},
+		Defaults: &tork.JobDefaults{
+			Timeout: "5s",
+			Retry: &tork.TaskRetry{
+				Limit: 2,
+			},
+			Limits: &tork.TaskLimits{
+				CPUs:   ".5",
+				Memory: "10MB",
+			},
+		},
 	}
 	err = ds.CreateJob(ctx, &j1)
 	assert.NoError(t, err)
@@ -387,6 +400,10 @@ func TestPostgresCreateAndGetJob(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, j1.ID, j2.ID)
 	assert.Equal(t, "val1", j2.Inputs["var1"])
+	assert.Equal(t, "5s", j2.Defaults.Timeout)
+	assert.Equal(t, 2, j2.Defaults.Retry.Limit)
+	assert.Equal(t, ".5", j2.Defaults.Limits.CPUs)
+	assert.Equal(t, "10MB", j2.Defaults.Limits.Memory)
 }
 
 func TestPostgresUpdateJob(t *testing.T) {
@@ -440,12 +457,13 @@ func TestPostgresUpdateJobConcurrently(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		go func() {
 			defer wg.Done()
-			err = ds.UpdateJob(ctx, j1.ID, func(u *tork.Job) error {
+			err := ds.UpdateJob(ctx, j1.ID, func(u *tork.Job) error {
 				u.State = tork.JobStateCompleted
 				u.Context.Inputs["var2"] = "val2"
 				u.Position = u.Position + 1
 				return nil
 			})
+			assert.NoError(t, err)
 		}()
 	}
 	wg.Wait()
@@ -498,8 +516,6 @@ func TestPostgresGetJobs(t *testing.T) {
 	p1, err := ds.GetJobs(ctx, "", 1, 10)
 	assert.NoError(t, err)
 	assert.Equal(t, 10, p1.Size)
-	assert.Empty(t, p1.Items[0].Tasks)
-	assert.Empty(t, p1.Items[0].Execution)
 	assert.Equal(t, 101, p1.TotalItems)
 
 	p2, err := ds.GetJobs(ctx, "", 2, 10)
@@ -571,7 +587,7 @@ func TestPostgresSearchJobs(t *testing.T) {
 	assert.Equal(t, 101, p1.TotalItems)
 }
 
-func TestPostgresGetStats(t *testing.T) {
+func TestPostgresGetMetrics(t *testing.T) {
 	ctx := context.Background()
 	schemaName := fmt.Sprintf("tork%d", rand.Int())
 	dsn := `host=localhost user=tork password=tork dbname=tork search_path=%s sslmode=disable`
@@ -585,7 +601,7 @@ func TestPostgresGetStats(t *testing.T) {
 	}()
 	err = ds.ExecScript(postgres.SCHEMA)
 	assert.NoError(t, err)
-	s, err := ds.GetStats(ctx)
+	s, err := ds.GetMetrics(ctx)
 	assert.NoError(t, err)
 	assert.Equal(t, 0, s.Jobs.Running)
 	assert.Equal(t, 0, s.Tasks.Running)
@@ -630,7 +646,7 @@ func TestPostgresGetStats(t *testing.T) {
 	}
 
 	for i := 0; i < 10; i++ {
-		err := ds.CreateNode(ctx, tork.Node{
+		err := ds.CreateNode(ctx, &tork.Node{
 			ID:              uuid.NewUUID(),
 			LastHeartbeatAt: time.Now().UTC().Add(-time.Minute * time.Duration(i)),
 			CPUPercent:      float64(i * 10),
@@ -638,7 +654,7 @@ func TestPostgresGetStats(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	s, err = ds.GetStats(ctx)
+	s, err = ds.GetMetrics(ctx)
 	assert.NoError(t, err)
 	assert.Equal(t, 50, s.Jobs.Running)
 	assert.Equal(t, 50, s.Tasks.Running)
@@ -698,4 +714,29 @@ func TestPostgresWithTxUpdateTask(t *testing.T) {
 	t11, err := ds.GetTaskByID(ctx, t1.ID)
 	assert.NoError(t, err)
 	assert.Equal(t, tork.TaskStateRunning, t11.State)
+}
+
+func TestPostgresHealthCheck(t *testing.T) {
+	ctx := context.Background()
+	schemaName := fmt.Sprintf("tork%d", rand.Int())
+	dsn := `host=localhost user=tork password=tork dbname=tork search_path=%s sslmode=disable`
+	ds, err := NewPostgresDataStore(fmt.Sprintf(dsn, schemaName))
+	assert.NoError(t, err)
+	_, err = ds.db.Exec(fmt.Sprintf("create schema %s", schemaName))
+	assert.NoError(t, err)
+	defer func() {
+		_, err = ds.db.Exec(fmt.Sprintf("drop schema %s cascade", schemaName))
+		assert.NoError(t, err)
+	}()
+	err = ds.ExecScript(postgres.SCHEMA)
+	assert.NoError(t, err)
+
+	err = ds.HealthCheck(ctx)
+	assert.NoError(t, err)
+
+	_, err = ds.db.Exec("drop table nodes cascade")
+	assert.NoError(t, err)
+
+	err = ds.HealthCheck(ctx)
+	assert.Error(t, err)
 }
