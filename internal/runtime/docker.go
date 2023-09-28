@@ -1,6 +1,9 @@
 package runtime
 
 import (
+	"archive/tar"
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -14,23 +17,23 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-units"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 	"github.com/runabol/tork"
 	"github.com/runabol/tork/internal/syncx"
+	tmount "github.com/runabol/tork/mount"
 )
 
 type DockerRuntime struct {
-	client *client.Client
-	tasks  *syncx.Map[string, string]
-	images *syncx.Map[string, bool]
-	pullq  chan *pullRequest
+	client  *client.Client
+	tasks   *syncx.Map[string, string]
+	images  *syncx.Map[string, bool]
+	pullq   chan *pullRequest
+	mounter *tmount.VolumeMounter
 }
 
 type printableReader struct {
@@ -72,11 +75,16 @@ func NewDockerRuntime() (*DockerRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	mounter, err := tmount.NewVolumeMounter()
+	if err != nil {
+		return nil, err
+	}
 	rt := &DockerRuntime{
-		client: dc,
-		tasks:  new(syncx.Map[string, string]),
-		images: new(syncx.Map[string, bool]),
-		pullq:  make(chan *pullRequest, 1),
+		client:  dc,
+		tasks:   new(syncx.Map[string, string]),
+		images:  new(syncx.Map[string, bool]),
+		pullq:   make(chan *pullRequest, 1),
+		mounter: mounter,
 	}
 	go rt.puller(context.Background())
 	return rt, nil
@@ -159,18 +167,19 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 	for name, value := range t.Env {
 		env = append(env, fmt.Sprintf("%s=%s", name, value))
 	}
+	env = append(env, "TORK_OUTPUT=/tork/stdout")
 
 	var mounts []mount.Mount
 
 	for _, m := range t.Mounts {
 		var mt mount.Type
 		switch m.Type {
-		case tork.MountTypeVolume:
+		case tmount.TypeVolume:
 			mt = mount.TypeVolume
 			if m.Target == "" {
 				return errors.Errorf("volume target is required")
 			}
-		case tork.MountTypeBind:
+		case tmount.TypeBind:
 			mt = mount.TypeBind
 			if m.Target == "" {
 				return errors.Errorf("bind target is required")
@@ -179,7 +188,7 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 				return errors.Errorf("bind source is required")
 			}
 		default:
-			return errors.Errorf("unknown volume type: %s", m.Type)
+			return errors.Errorf("unknown mount type: %s", m.Type)
 		}
 		mount := mount.Mount{
 			Type:   mt,
@@ -189,12 +198,29 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 		log.Debug().Msgf("Mounting %s -> %s", mount.Source, mount.Target)
 		mounts = append(mounts, mount)
 	}
+	// create the workdir mount
+	workdir := &tmount.Mount{Target: "/tork"}
+	if err := d.mounter.Mount(ctx, workdir); err != nil {
+		return err
+	}
+	defer func() {
+		uctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+		if err := d.mounter.Unmount(uctx, workdir); err != nil {
+			log.Error().Err(err).Msgf("error unmounting workdir")
+		}
+	}()
+	mounts = append(mounts, mount.Mount{
+		Type:   mount.TypeVolume,
+		Source: workdir.Source,
+		Target: workdir.Target,
+	})
 
+	// parse task limits
 	cpus, err := parseCPUs(t.Limits)
 	if err != nil {
 		return errors.Wrapf(err, "invalid CPUs value")
 	}
-
 	mem, err := parseMemory(t.Limits)
 	if err != nil {
 		return errors.Wrapf(err, "invalid memory value")
@@ -208,11 +234,10 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 			Memory:   mem,
 		},
 	}
-	var workdir string
+
 	cmd := t.CMD
 	if len(cmd) == 0 {
 		cmd = []string{"./entrypoint"}
-		workdir = "/tork"
 	}
 	entrypoint := t.Entrypoint
 	if len(entrypoint) == 0 && t.Run != "" {
@@ -223,7 +248,7 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 		Env:        env,
 		Cmd:        cmd,
 		Entrypoint: entrypoint,
-		WorkingDir: workdir,
+		WorkingDir: workdir.Target,
 	}
 
 	nc := network.NetworkingConfig{
@@ -244,7 +269,7 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 		return err
 	}
 
-	d.tasks.Set(t.ID, resp.ID)
+	log.Debug().Msgf("created container %s", resp.ID)
 
 	// remove the container
 	defer func() {
@@ -257,11 +282,23 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 				Msg("error removing container upon completion")
 		}
 	}()
+
+	// initialize the work directory
+	if err := d.initWorkdir(ctx, resp.ID, t); err != nil {
+		return errors.Wrapf(err, "error initializing container")
+	}
+
+	// create a mapping between task id and container id
+	d.tasks.Set(t.ID, resp.ID)
+
+	// start the container
+	log.Debug().Msgf("Starting container %s", resp.ID)
 	err = d.client.ContainerStart(
 		ctx, resp.ID, types.ContainerStartOptions{})
 	if err != nil {
 		return errors.Wrapf(err, "error starting container %s: %v\n", resp.ID, err)
 	}
+	// read the container's stdout
 	out, err := d.client.ContainerLogs(
 		ctx,
 		resp.ID,
@@ -290,7 +327,7 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 			return err
 		}
 	case status := <-statusCh:
-		if status.StatusCode != 0 {
+		if status.StatusCode != 0 { // error
 			out, err := d.client.ContainerLogs(
 				ctx,
 				resp.ID,
@@ -310,6 +347,12 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 				log.Error().Err(err).Msg("error copying the output")
 			}
 			return errors.Errorf("exit code %d: %s", status.StatusCode, bufout.String())
+		} else {
+			stdout, err := d.readOutput(ctx, resp.ID)
+			if err != nil {
+				return err
+			}
+			t.Result = stdout
 		}
 		log.Debug().
 			Int64("status-code", status.StatusCode).
@@ -317,6 +360,131 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 			Msg("task completed")
 	}
 	return nil
+}
+
+func (d *DockerRuntime) readOutput(ctx context.Context, containerID string) (string, error) {
+	r, _, err := d.client.CopyFromContainer(ctx, containerID, "/tork/stdout")
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		err := r.Close()
+		if err != nil {
+			log.Error().Err(err).Msgf("error closing /tork/stdout reader")
+		}
+	}()
+	tr := tar.NewReader(r)
+	var buf bytes.Buffer
+	for {
+		_, err := tr.Next()
+		if err == io.EOF {
+			break // End of archive
+		}
+		if err != nil {
+			return "", err
+		}
+
+		if _, err := io.Copy(&buf, tr); err != nil {
+			return "", err
+		}
+	}
+	return buf.String(), nil
+}
+
+func (d *DockerRuntime) initWorkdir(ctx context.Context, containerID string, t *tork.Task) error {
+	log.Debug().Msgf("initialize the workdir for container %s", containerID)
+	// create the archive
+	filename, err := createArchive(t)
+	if err != nil {
+		return err
+	}
+	// clean up the archive
+	defer func() {
+		err := os.Remove(filename)
+		if err != nil {
+			log.Error().Err(err).Msgf("error removing archive: %s", filename)
+		}
+	}()
+	// open the archive for reading by the container
+	ar, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	// close the archive
+	defer func() {
+		err := ar.Close()
+		if err != nil {
+			log.Error().Err(err).Msg("error closing archive file")
+		}
+	}()
+	r := bufio.NewReader(ar)
+	if err := d.client.CopyToContainer(ctx, containerID, "/tork", r, types.CopyToContainerOptions{}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func createArchive(t *tork.Task) (string, error) {
+	// create an archive file
+	ar, err := os.CreateTemp("", "archive-*.tar")
+	if err != nil {
+		return "", errors.Wrapf(err, "error creating tar file")
+	}
+	defer func() {
+		if err := ar.Close(); err != nil {
+			log.Error().Err(err).Msg("error closing archive.tar file")
+		}
+	}()
+	// write the run script as an entrypoint
+	buf := bufio.NewWriter(ar)
+	tw := tar.NewWriter(buf)
+	if t.Run != "" {
+		hdr := &tar.Header{
+			Name: "entrypoint",
+			Mode: 0111, // execute only
+			Size: int64(len(t.Run)),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return "", err
+		}
+		if _, err := tw.Write([]byte(t.Run)); err != nil {
+			return "", err
+		}
+	}
+	// write an stdout placeholder file
+	hdr := &tar.Header{
+		Name: "stdout",
+		Mode: 0222, // write-only
+		Size: int64(0),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return "", err
+	}
+	if _, err := tw.Write([]byte{}); err != nil {
+		return "", err
+	}
+	// write all other files specified on the task
+	for filename, contents := range t.Files {
+		hdr := &tar.Header{
+			Name: filename,
+			Mode: 0444, // read-only
+			Size: int64(len(contents)),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return "", err
+		}
+		if _, err := tw.Write([]byte(contents)); err != nil {
+			return "", err
+		}
+	}
+	if err := buf.Flush(); err != nil {
+		return "", err
+	}
+	// close the tar writer
+	if err := tw.Close(); err != nil {
+		return "", err
+	}
+	return ar.Name(), nil
 }
 
 func (d *DockerRuntime) Stop(ctx context.Context, t *tork.Task) error {
@@ -359,29 +527,4 @@ func parseMemory(limits *tork.TaskLimits) (int64, error) {
 		return 0, nil
 	}
 	return units.RAMInBytes(limits.Memory)
-}
-
-func (d *DockerRuntime) CreateVolume(ctx context.Context, name string) error {
-	v, err := d.client.VolumeCreate(ctx, volume.CreateOptions{Name: name})
-	if err != nil {
-		return err
-	}
-	log.Debug().
-		Str("mount-point", v.Mountpoint).Msgf("created volume %s", v.Name)
-	return nil
-}
-
-func (d *DockerRuntime) DeleteVolume(ctx context.Context, name string) error {
-	ls, err := d.client.VolumeList(ctx, filters.NewArgs(filters.Arg("name", name)))
-	if err != nil {
-		return err
-	}
-	if len(ls.Volumes) == 0 {
-		return errors.Errorf("unknown volume: %s", name)
-	}
-	if err := d.client.VolumeRemove(ctx, name, true); err != nil {
-		return err
-	}
-	log.Debug().Msgf("removed volume %s", name)
-	return nil
 }

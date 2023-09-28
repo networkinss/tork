@@ -4,11 +4,14 @@ import (
 	"context"
 
 	"github.com/runabol/tork"
+	"github.com/runabol/tork/datastore"
 	"github.com/runabol/tork/input"
 	"github.com/runabol/tork/middleware/job"
 	"github.com/runabol/tork/middleware/node"
 	"github.com/runabol/tork/middleware/task"
 	"github.com/runabol/tork/middleware/web"
+	"github.com/runabol/tork/mount"
+	"github.com/runabol/tork/mq"
 )
 
 var defaultEngine *Engine = New(Config{})
@@ -27,6 +30,18 @@ func RegisterJobMiddleware(mw job.MiddlewareFunc) {
 
 func RegisterNodeMiddleware(mw node.MiddlewareFunc) {
 	defaultEngine.RegisterNodeMiddleware(mw)
+}
+
+func RegisterMounter(mtype string, mounter mount.Mounter) {
+	defaultEngine.RegisterMounter(mtype, mounter)
+}
+
+func RegisterDatastoreProvider(name string, provider datastore.Provider) {
+	defaultEngine.RegisterDatastoreProvider(name, provider)
+}
+
+func RegisterBrokerProvider(name string, provider mq.Provider) {
+	defaultEngine.RegisterBrokerProvider(name, provider)
 }
 
 func RegisterEndpoint(method, path string, handler web.HandlerFunc) {

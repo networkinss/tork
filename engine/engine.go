@@ -20,6 +20,7 @@ import (
 	"github.com/runabol/tork/middleware/node"
 	"github.com/runabol/tork/middleware/task"
 	"github.com/runabol/tork/middleware/web"
+	"github.com/runabol/tork/mount"
 	"github.com/runabol/tork/mq"
 )
 
@@ -47,8 +48,11 @@ type Engine struct {
 	mu          sync.Mutex
 	broker      mq.Broker
 	ds          datastore.Datastore
+	mounter     *mount.MultiMounter
 	coordinator *coordinator.Coordinator
 	worker      *worker.Worker
+	dsProviders map[string]datastore.Provider
+	mqProviders map[string]mq.Provider
 }
 
 type Config struct {
@@ -69,11 +73,14 @@ func New(cfg Config) *Engine {
 		cfg.Endpoints = make(map[string]web.HandlerFunc)
 	}
 	return &Engine{
-		quit:       make(chan os.Signal, 1),
-		terminate:  make(chan any),
-		terminated: make(chan any),
-		cfg:        cfg,
-		state:      StateIdle,
+		quit:        make(chan os.Signal, 1),
+		terminate:   make(chan any),
+		terminated:  make(chan any),
+		cfg:         cfg,
+		state:       StateIdle,
+		mounter:     mount.NewMultiMounter(),
+		dsProviders: make(map[string]datastore.Provider),
+		mqProviders: make(map[string]mq.Provider),
 	}
 }
 
@@ -259,6 +266,33 @@ func (e *Engine) RegisterEndpoint(method, path string, handler web.HandlerFunc) 
 	defer e.mu.Unlock()
 	e.mustState(StateIdle)
 	e.cfg.Endpoints[fmt.Sprintf("%s %s", method, path)] = handler
+}
+
+func (e *Engine) RegisterMounter(mtype string, mounter mount.Mounter) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	e.mounter.RegisterMounter(mtype, mounter)
+}
+
+func (e *Engine) RegisterDatastoreProvider(name string, provider datastore.Provider) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	if _, ok := e.dsProviders[name]; ok {
+		panic("engine: RegisterDatastoreProvider called twice for driver " + name)
+	}
+	e.dsProviders[name] = provider
+}
+
+func (e *Engine) RegisterBrokerProvider(name string, provider mq.Provider) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	if _, ok := e.mqProviders[name]; ok {
+		panic("engine: RegisterBrokerProvider called twice for driver " + name)
+	}
+	e.mqProviders[name] = provider
 }
 
 func (e *Engine) SubmitJob(ctx context.Context, ij *input.Job, listeners ...web.JobListener) (*tork.Job, error) {

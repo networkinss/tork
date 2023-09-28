@@ -13,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 	"github.com/runabol/tork"
+	"github.com/runabol/tork/mount"
 )
 
 type PostgresDatastore struct {
@@ -159,7 +160,7 @@ func (r taskRecord) toTask() (*tork.Task, error) {
 			return nil, errors.Wrapf(err, "error deserializing task.registry")
 		}
 	}
-	var mounts []tork.Mount
+	var mounts []mount.Mount
 	if r.Mounts != nil {
 		if err := json.Unmarshal(r.Mounts, &mounts); err != nil {
 			return nil, errors.Wrapf(err, "error deserializing task.registry")
@@ -648,9 +649,14 @@ func (ds *PostgresDatastore) CreateJob(ctx context.Context, j *tork.Job) error {
 	if err != nil {
 		return errors.Wrapf(err, "failed to serialize job.inputs")
 	}
-	defaults, err := json.Marshal(j.Defaults)
-	if err != nil {
-		return errors.Wrapf(err, "failed to serialize job.defaults")
+	var defaults *string
+	if j.Defaults != nil {
+		b, err := json.Marshal(j.Defaults)
+		if err != nil {
+			return errors.Wrapf(err, "failed to serialize job.defaults")
+		}
+		s := string(b)
+		defaults = &s
 	}
 	q := `insert into jobs 
 	       (id,name,description,state,created_at,started_at,tasks,position,

@@ -2,17 +2,18 @@ package runtime
 
 import (
 	"context"
-	"os"
-	"path"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
+
 	"github.com/runabol/tork"
 
 	"github.com/runabol/tork/internal/uuid"
+	"github.com/runabol/tork/mount"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -54,10 +55,11 @@ func TestNewDockerRuntime(t *testing.T) {
 	assert.NotNil(t, rt)
 }
 
-func TestRunTask(t *testing.T) {
+func TestRunTaskCMD(t *testing.T) {
 	rt, err := NewDockerRuntime()
 	assert.NoError(t, err)
 	assert.NotNil(t, rt)
+
 	err = rt.Run(context.Background(), &tork.Task{
 		ID:    uuid.NewUUID(),
 		Image: "ubuntu:mantic",
@@ -128,7 +130,6 @@ func TestRunTaskWithNetwork(t *testing.T) {
 		Networks: []string{"default"},
 	})
 	assert.NoError(t, err)
-
 	rt, err = NewDockerRuntime()
 	assert.NoError(t, err)
 	assert.NotNil(t, rt)
@@ -141,84 +142,55 @@ func TestRunTaskWithNetwork(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestCreateVolume(t *testing.T) {
-	rt, err := NewDockerRuntime()
-	assert.NoError(t, err)
-
-	ctx := context.Background()
-	err = rt.CreateVolume(ctx, "testvol")
-	assert.NoError(t, err)
-
-	ls, err := rt.client.VolumeList(ctx, filters.Args{})
-	assert.NoError(t, err)
-	found := false
-	for _, v := range ls.Volumes {
-		if v.Name == "testvol" {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found)
-
-	err = rt.DeleteVolume(ctx, "testvol")
-	assert.NoError(t, err)
-
-	ls, err = rt.client.VolumeList(ctx, filters.Args{})
-	assert.NoError(t, err)
-
-	for _, v := range ls.Volumes {
-		assert.NotEqual(t, "testvol", v.Name)
-	}
-}
-
 func TestRunTaskWithVolume(t *testing.T) {
 	rt, err := NewDockerRuntime()
 	assert.NoError(t, err)
-	assert.NotNil(t, rt)
 
-	vname := uuid.NewUUID()
+	vm, err := mount.NewVolumeMounter()
+	assert.NoError(t, err)
+
+	vmnt := mount.Mount{
+		Type:   mount.TypeVolume,
+		Target: "/xyz",
+	}
 
 	ctx := context.Background()
-	err = rt.CreateVolume(ctx, vname)
+	err = vm.Mount(ctx, &vmnt)
 	assert.NoError(t, err)
 
 	defer func() {
-		err = rt.DeleteVolume(ctx, vname)
+		err = vm.Unmount(ctx, &vmnt)
 		assert.NoError(t, err)
 	}()
-
-	rundir, err := os.MkdirTemp("/tmp", "tork-")
-	assert.NoError(t, err)
-
-	defer func() {
-		err := os.RemoveAll(rundir)
-		assert.NoError(t, err)
-	}()
-
-	script := `echo hello world > /xyz/thing`
-
-	err = os.WriteFile(path.Join(rundir, "entrypoint"), []byte(script), os.ModePerm)
-	assert.NoError(t, err)
 
 	t1 := &tork.Task{
 		ID:    uuid.NewUUID(),
 		Image: "ubuntu:mantic",
-		Run:   "-",
-		Mounts: []tork.Mount{
-			{
-				Type:   tork.MountTypeVolume,
-				Source: vname,
-				Target: "/xyz",
-			},
-			{
-				Type:   tork.MountTypeBind,
-				Source: rundir,
-				Target: "/tork",
-			},
+		Run:   "echo hello world > /xyz/thing",
+		Mounts: []mount.Mount{
+			vmnt,
 		},
 	}
 	err = rt.Run(ctx, t1)
 	assert.NoError(t, err)
+}
+
+func TestRunTaskInitWorkdir(t *testing.T) {
+	rt, err := NewDockerRuntime()
+	assert.NoError(t, err)
+	t1 := &tork.Task{
+		ID:    uuid.NewUUID(),
+		Image: "ubuntu:mantic",
+		Run:   "cat hello.txt > $TORK_OUTPUT",
+		Files: map[string]string{
+			"hello.txt": "hello world",
+			"large.txt": strings.Repeat("a", 100_000),
+		},
+	}
+	ctx := context.Background()
+	err = rt.Run(ctx, t1)
+	assert.NoError(t, err)
+	assert.Equal(t, "hello world", t1.Result)
 }
 
 func Test_imagePull(t *testing.T) {

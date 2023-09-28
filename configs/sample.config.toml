@@ -36,7 +36,7 @@ completed = 1 # completed queue consumers
 error = 1     # error queue consumers
 pending = 1   # pending queue consumers
 started = 1   # started queue consumers
-hearbeat = 1  # heartbeat queue consumers
+heartbeat = 1 # heartbeat queue consumers
 jobs = 1      # jobs queue consumers
 
 # cors middleware
@@ -69,7 +69,6 @@ enabled = false
 
 [worker]
 address = "localhost:8001"
-tempdir = "/tmp"
 
 # default task limits
 [worker.limits]
@@ -77,7 +76,10 @@ cpus = ""   # supports fractions
 memory = "" # e.g. 100m 
 
 
-[worker.mounts.bind]
+[mounts.bind]
 allowed = false
 allowlist = []  # supports wildcards (*)
 denylist = []   # supports wildcards (*)
+
+[mounts.temp]
+dir = "/tmp"

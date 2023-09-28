@@ -12,9 +12,10 @@ import (
 	"github.com/runabol/tork/middleware/job"
 	"github.com/runabol/tork/middleware/node"
 	"github.com/runabol/tork/middleware/task"
+	"github.com/runabol/tork/mount"
 	"github.com/runabol/tork/mq"
 
-	"github.com/runabol/tork/runtime"
+	"github.com/runabol/tork/internal/runtime"
 
 	"github.com/runabol/tork/internal/uuid"
 	"github.com/runabol/tork/internal/worker"
@@ -44,7 +45,7 @@ func TestTaskMiddlewareWithResult(t *testing.T) {
 		Middleware: Middleware{
 			Task: []task.MiddlewareFunc{
 				func(next task.HandlerFunc) task.HandlerFunc {
-					return func(ctx context.Context, t *tork.Task) error {
+					return func(ctx context.Context, et task.EventType, t *tork.Task) error {
 						t.Result = "some result"
 						return nil
 					}
@@ -55,7 +56,7 @@ func TestTaskMiddlewareWithResult(t *testing.T) {
 	assert.NotNil(t, c)
 
 	tk := &tork.Task{}
-	assert.NoError(t, c.onPending(context.Background(), tk))
+	assert.NoError(t, c.onPending(context.Background(), task.StateChange, tk))
 	assert.Equal(t, "some result", tk.Result)
 }
 
@@ -67,7 +68,7 @@ func TestTaskMiddlewareWithError(t *testing.T) {
 		Middleware: Middleware{
 			Task: []task.MiddlewareFunc{
 				func(next task.HandlerFunc) task.HandlerFunc {
-					return func(ctx context.Context, t *tork.Task) error {
+					return func(ctx context.Context, et task.EventType, t *tork.Task) error {
 						return Err
 					}
 				},
@@ -76,7 +77,7 @@ func TestTaskMiddlewareWithError(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	assert.NotNil(t, c)
-	assert.ErrorIs(t, c.onPending(context.Background(), &tork.Task{}), Err)
+	assert.ErrorIs(t, c.onPending(context.Background(), task.StateChange, &tork.Task{}), Err)
 }
 
 func TestTaskMiddlewareNoOp(t *testing.T) {
@@ -87,8 +88,8 @@ func TestTaskMiddlewareNoOp(t *testing.T) {
 		Middleware: Middleware{
 			Task: []task.MiddlewareFunc{
 				func(next task.HandlerFunc) task.HandlerFunc {
-					return func(ctx context.Context, t *tork.Task) error {
-						return next(ctx, t)
+					return func(ctx context.Context, et task.EventType, t *tork.Task) error {
+						return next(ctx, et, t)
 					}
 				},
 			},
@@ -114,7 +115,7 @@ func TestTaskMiddlewareNoOp(t *testing.T) {
 	err = ds.CreateTask(context.Background(), tk)
 	assert.NoError(t, err)
 
-	err = c.onPending(context.Background(), tk)
+	err = c.onPending(context.Background(), task.StateChange, tk)
 	assert.NoError(t, err)
 
 	t2, err := ds.GetTaskByID(context.Background(), tk.ID)
@@ -307,9 +308,13 @@ func doRunJob(t *testing.T, filename string) *tork.Job {
 	rt, err := runtime.NewDockerRuntime()
 	assert.NoError(t, err)
 
+	mounter, err := mount.NewVolumeMounter()
+	assert.NoError(t, err)
+
 	w, err := worker.NewWorker(worker.Config{
 		Broker:  b,
 		Runtime: rt,
+		Mounter: mounter,
 		Queues: map[string]int{
 			"default": 2,
 		},

@@ -89,8 +89,8 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 	if cfg.Queues[mq.QUEUE_STARTED] < 1 {
 		cfg.Queues[mq.QUEUE_STARTED] = 1
 	}
-	if cfg.Queues[mq.QUEUE_HEARBEAT] < 1 {
-		cfg.Queues[mq.QUEUE_HEARBEAT] = 1
+	if cfg.Queues[mq.QUEUE_HEARTBEAT] < 1 {
+		cfg.Queues[mq.QUEUE_HEARTBEAT] = 1
 	}
 	if cfg.Queues[mq.QUEUE_JOBS] < 1 {
 		cfg.Queues[mq.QUEUE_JOBS] = 1
@@ -103,6 +103,7 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 			Web:  cfg.Middleware.Web,
 			Echo: cfg.Middleware.Echo,
 			Job:  cfg.Middleware.Job,
+			Task: cfg.Middleware.Task,
 		},
 		Endpoints: cfg.Endpoints,
 		Enabled:   cfg.Enabled,
@@ -184,21 +185,21 @@ func (c *Coordinator) Start() error {
 			switch qname {
 			case mq.QUEUE_PENDING:
 				err = c.broker.SubscribeForTasks(qname, func(t *tork.Task) error {
-					return c.onPending(context.Background(), t)
+					return c.onPending(context.Background(), task.StateChange, t)
 				})
 			case mq.QUEUE_COMPLETED:
 				err = c.broker.SubscribeForTasks(qname, func(t *tork.Task) error {
-					return c.onCompleted(context.Background(), t)
+					return c.onCompleted(context.Background(), task.StateChange, t)
 				})
 			case mq.QUEUE_STARTED:
 				err = c.broker.SubscribeForTasks(qname, func(t *tork.Task) error {
-					return c.onStarted(context.Background(), t)
+					return c.onStarted(context.Background(), task.StateChange, t)
 				})
 			case mq.QUEUE_ERROR:
 				err = c.broker.SubscribeForTasks(qname, func(t *tork.Task) error {
-					return c.onError(context.Background(), t)
+					return c.onError(context.Background(), task.StateChange, t)
 				})
-			case mq.QUEUE_HEARBEAT:
+			case mq.QUEUE_HEARTBEAT:
 				err = c.broker.SubscribeForHeartbeats(func(n *tork.Node) error {
 					return c.onHeartbeat(context.Background(), n)
 				})
