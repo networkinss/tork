@@ -10,7 +10,8 @@ import (
 	"github.com/runabol/tork/middleware/node"
 	"github.com/runabol/tork/middleware/task"
 	"github.com/runabol/tork/middleware/web"
-	"github.com/runabol/tork/mount"
+	"github.com/runabol/tork/runtime"
+
 	"github.com/runabol/tork/mq"
 )
 
@@ -32,8 +33,12 @@ func RegisterNodeMiddleware(mw node.MiddlewareFunc) {
 	defaultEngine.RegisterNodeMiddleware(mw)
 }
 
-func RegisterMounter(mtype string, mounter mount.Mounter) {
-	defaultEngine.RegisterMounter(mtype, mounter)
+func RegisterMounter(runtime, name string, mounter runtime.Mounter) {
+	defaultEngine.RegisterMounter(runtime, name, mounter)
+}
+
+func RegisterRuntime(rt runtime.Runtime) {
+	defaultEngine.RegisterRuntime(rt)
 }
 
 func RegisterDatastoreProvider(name string, provider datastore.Provider) {

@@ -1,4 +1,4 @@
-package runtime
+package docker
 
 import (
 	"context"
@@ -13,7 +13,8 @@ import (
 	"github.com/runabol/tork"
 
 	"github.com/runabol/tork/internal/uuid"
-	"github.com/runabol/tork/mount"
+	"github.com/runabol/tork/runtime"
+
 	"github.com/stretchr/testify/assert"
 )
 
@@ -146,31 +147,42 @@ func TestRunTaskWithVolume(t *testing.T) {
 	rt, err := NewDockerRuntime()
 	assert.NoError(t, err)
 
-	vm, err := mount.NewVolumeMounter()
-	assert.NoError(t, err)
-
-	vmnt := mount.Mount{
-		Type:   mount.TypeVolume,
-		Target: "/xyz",
-	}
-
 	ctx := context.Background()
-	err = vm.Mount(ctx, &vmnt)
-	assert.NoError(t, err)
-
-	defer func() {
-		err = vm.Unmount(ctx, &vmnt)
-		assert.NoError(t, err)
-	}()
 
 	t1 := &tork.Task{
 		ID:    uuid.NewUUID(),
 		Image: "ubuntu:mantic",
 		Run:   "echo hello world > /xyz/thing",
-		Mounts: []mount.Mount{
-			vmnt,
+		Mounts: []tork.Mount{
+			{
+				Type:   tork.MountTypeVolume,
+				Target: "/xyz",
+			},
 		},
 	}
+	err = rt.Run(ctx, t1)
+	assert.NoError(t, err)
+}
+
+func TestRunTaskWithCustomMounter(t *testing.T) {
+	mounter := runtime.NewMultiMounter()
+	vmounter, err := NewVolumeMounter()
+	assert.NoError(t, err)
+	mounter.RegisterMounter(tork.MountTypeVolume, vmounter)
+	rt, err := NewDockerRuntime(WithMounter(mounter))
+	assert.NoError(t, err)
+	t1 := &tork.Task{
+		ID:    uuid.NewUUID(),
+		Image: "ubuntu:mantic",
+		Run:   "echo hello world > /xyz/thing",
+		Mounts: []tork.Mount{
+			{
+				Type:   tork.MountTypeVolume,
+				Target: "/xyz",
+			},
+		},
+	}
+	ctx := context.Background()
 	err = rt.Run(ctx, t1)
 	assert.NoError(t, err)
 }

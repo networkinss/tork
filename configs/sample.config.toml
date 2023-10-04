@@ -83,3 +83,11 @@ denylist = []   # supports wildcards (*)
 
 [mounts.temp]
 dir = "/tmp"
+
+[runtime]
+type = "docker" # docker | shell
+
+[runtime.shell]
+cmd = ["bash", "-c"] # the shell command used to execute the run script
+uid = ""             # set the uid for the the task process (recommended)
+gid = ""             # set the gid for the the task process (recommended)

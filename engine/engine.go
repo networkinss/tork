@@ -20,7 +20,8 @@ import (
 	"github.com/runabol/tork/middleware/node"
 	"github.com/runabol/tork/middleware/task"
 	"github.com/runabol/tork/middleware/web"
-	"github.com/runabol/tork/mount"
+	"github.com/runabol/tork/runtime"
+
 	"github.com/runabol/tork/mq"
 )
 
@@ -48,7 +49,8 @@ type Engine struct {
 	mu          sync.Mutex
 	broker      mq.Broker
 	ds          datastore.Datastore
-	mounter     *mount.MultiMounter
+	mounters    map[string]*runtime.MultiMounter
+	runtime     runtime.Runtime
 	coordinator *coordinator.Coordinator
 	worker      *worker.Worker
 	dsProviders map[string]datastore.Provider
@@ -78,7 +80,7 @@ func New(cfg Config) *Engine {
 		terminated:  make(chan any),
 		cfg:         cfg,
 		state:       StateIdle,
-		mounter:     mount.NewMultiMounter(),
+		mounters:    make(map[string]*runtime.MultiMounter),
 		dsProviders: make(map[string]datastore.Provider),
 		mqProviders: make(map[string]mq.Provider),
 	}
@@ -268,11 +270,26 @@ func (e *Engine) RegisterEndpoint(method, path string, handler web.HandlerFunc) 
 	e.cfg.Endpoints[fmt.Sprintf("%s %s", method, path)] = handler
 }
 
-func (e *Engine) RegisterMounter(mtype string, mounter mount.Mounter) {
+func (e *Engine) RegisterMounter(rt string, name string, mounter runtime.Mounter) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.mustState(StateIdle)
-	e.mounter.RegisterMounter(mtype, mounter)
+	mounters, ok := e.mounters[rt]
+	if !ok {
+		mounters = runtime.NewMultiMounter()
+		e.mounters[rt] = mounters
+	}
+	mounters.RegisterMounter(name, mounter)
+}
+
+func (e *Engine) RegisterRuntime(rt runtime.Runtime) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mustState(StateIdle)
+	if e.runtime != nil {
+		panic("engine: RegisterRuntime called twice")
+	}
+	e.runtime = rt
 }
 
 func (e *Engine) RegisterDatastoreProvider(name string, provider datastore.Provider) {
