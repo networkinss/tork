@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/runabol/tork/conf"
 	"github.com/runabol/tork/internal/coordinator"
+	"github.com/runabol/tork/internal/redact"
 	"github.com/runabol/tork/internal/uuid"
 	"github.com/runabol/tork/internal/wildcard"
 	"github.com/runabol/tork/middleware/job"
@@ -23,6 +24,7 @@ func (e *Engine) initCoordinator() error {
 	queues := conf.IntMap("coordinator.queues")
 
 	cfg := coordinator.Config{
+		Name:      conf.StringDefault("coordinator.name", "Coordinator"),
 		Broker:    e.broker,
 		DataStore: e.ds,
 		Queues:    queues,
@@ -41,9 +43,18 @@ func (e *Engine) initCoordinator() error {
 	// redact
 	redactJobEnabled := conf.BoolDefault("middleware.job.redact.enabled", false)
 	if redactJobEnabled {
-		cfg.Middleware.Job = append(cfg.Middleware.Job, job.Redact)
-		cfg.Middleware.Task = append(cfg.Middleware.Task, task.Redact)
+		patterns := conf.Strings("middleware.job.redact.patterns")
+		matchers := make([]redact.Matcher, len(patterns))
+		for i, pattern := range patterns {
+			matchers[i] = redact.Wildcard(pattern)
+		}
+		cfg.Middleware.Job = append(cfg.Middleware.Job, job.Redact(redact.NewRedacter(matchers...)))
+		cfg.Middleware.Task = append(cfg.Middleware.Task, task.Redact(redact.NewRedacter(matchers...)))
 	}
+
+	// webhook middleware
+	cfg.Middleware.Job = append(cfg.Middleware.Job, job.Webhook)
+	cfg.Middleware.Task = append(cfg.Middleware.Task, task.Webhook(e.ds))
 
 	c, err := coordinator.NewCoordinator(cfg)
 	if err != nil {

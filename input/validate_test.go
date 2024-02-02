@@ -1,6 +1,7 @@
 package input
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/go-playground/validator/v10"
@@ -83,6 +84,44 @@ func TestValidateJobNoName(t *testing.T) {
 		},
 	}
 	err := j.Validate()
+	assert.Error(t, err)
+}
+
+func TestValidateVar(t *testing.T) {
+	j := Job{
+		Name: "test job",
+		Tasks: []Task{
+			{
+				Name: "test task",
+				Var:  "somevar",
+			},
+		},
+	}
+	err := j.Validate()
+	assert.NoError(t, err)
+
+	j = Job{
+		Name: "test job",
+		Tasks: []Task{
+			{
+				Name: "test task",
+				Var:  strings.Repeat("a", 64),
+			},
+		},
+	}
+	err = j.Validate()
+	assert.NoError(t, err)
+
+	j = Job{
+		Name: "test job",
+		Tasks: []Task{
+			{
+				Name: "test task",
+				Var:  strings.Repeat("a", 65),
+			},
+		},
+	}
+	err = j.Validate()
 	assert.Error(t, err)
 }
 
@@ -176,6 +215,52 @@ func TestValidateJobTaskTimeout(t *testing.T) {
 	}
 	err := j.Validate()
 	assert.NoError(t, err)
+}
+
+func TestValidateSubJob(t *testing.T) {
+	j := Job{
+		Name: "test job",
+		Tasks: []Task{
+			{
+				Name: "test task",
+				SubJob: &SubJob{
+					Name: "test sub job",
+					Webhooks: []Webhook{{
+						URL: "http://example.com",
+					}},
+					Tasks: []Task{{
+						Name:  "test task",
+						Image: "some task",
+					}},
+				},
+			},
+		},
+	}
+	err := j.Validate()
+	assert.NoError(t, err)
+}
+
+func TestValidateSubJobBadWebhook(t *testing.T) {
+	j := Job{
+		Name: "test job",
+		Tasks: []Task{
+			{
+				Name: "test task",
+				SubJob: &SubJob{
+					Name: "test sub job",
+					Webhooks: []Webhook{{
+						URL: "",
+					}},
+					Tasks: []Task{{
+						Name:  "test task",
+						Image: "some task",
+					}},
+				},
+			},
+		},
+	}
+	err := j.Validate()
+	assert.Error(t, err)
 }
 
 func TestValidateParallelOrEachTaskType(t *testing.T) {
@@ -521,6 +606,38 @@ func TestValidateMounts(t *testing.T) {
 						Target: "/tork",
 					},
 				},
+			},
+		},
+	}
+	err = j.Validate()
+	assert.Error(t, err)
+}
+
+func TestValidateWebhook(t *testing.T) {
+	j := Job{
+		Name: "test job",
+		Webhooks: []Webhook{{
+			URL: "http://example.com",
+		}},
+		Tasks: []Task{
+			{
+				Name:  "test task",
+				Image: "some:image",
+			},
+		},
+	}
+	err := j.Validate()
+	assert.NoError(t, err)
+
+	j = Job{
+		Name: "test job",
+		Webhooks: []Webhook{{
+			URL: "",
+		}},
+		Tasks: []Task{
+			{
+				Name:  "test task",
+				Image: "some:image",
 			},
 		},
 	}

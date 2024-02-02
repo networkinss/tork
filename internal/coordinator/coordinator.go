@@ -2,7 +2,7 @@ package coordinator
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -13,6 +13,7 @@ import (
 	"github.com/runabol/tork/datastore"
 	"github.com/runabol/tork/internal/coordinator/api"
 	"github.com/runabol/tork/internal/coordinator/handlers"
+	"github.com/runabol/tork/internal/host"
 
 	"github.com/runabol/tork/input"
 	"github.com/runabol/tork/middleware/job"
@@ -29,6 +30,8 @@ import (
 // clients, scheduling tasks for workers to execute and for
 // exposing the cluster's state to the outside world.
 type Coordinator struct {
+	id          string
+	startTime   time.Time
 	Name        string
 	broker      mq.Broker
 	api         *api.API
@@ -40,9 +43,12 @@ type Coordinator struct {
 	onJob       job.HandlerFunc
 	onHeartbeat node.HandlerFunc
 	onCompleted task.HandlerFunc
+	onLogPart   func(*tork.TaskLogPart)
+	stop        chan any
 }
 
 type Config struct {
+	Name       string
 	Broker     mq.Broker
 	DataStore  datastore.Datastore
 	Address    string
@@ -67,7 +73,6 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 	if cfg.DataStore == nil {
 		return nil, errors.New("most provide a datastore")
 	}
-	name := fmt.Sprintf("coordinator-%s", uuid.NewUUID())
 	if cfg.Queues == nil {
 		cfg.Queues = make(map[string]int)
 	}
@@ -95,6 +100,9 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 	if cfg.Queues[mq.QUEUE_JOBS] < 1 {
 		cfg.Queues[mq.QUEUE_JOBS] = 1
 	}
+	if cfg.Queues[mq.QUEUE_LOGS] < 1 {
+		cfg.Queues[mq.QUEUE_LOGS] = 1
+	}
 	api, err := api.NewAPI(api.Config{
 		Broker:    cfg.Broker,
 		DataStore: cfg.DataStore,
@@ -118,12 +126,20 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 	)
 
 	onStarted := task.ApplyMiddleware(
-		handlers.NewStartedHandler(cfg.DataStore, cfg.Broker),
+		handlers.NewStartedHandler(
+			cfg.DataStore,
+			cfg.Broker,
+			cfg.Middleware.Job...,
+		),
 		cfg.Middleware.Task,
 	)
 
 	onError := task.ApplyMiddleware(
-		handlers.NewErrorHandler(cfg.DataStore, cfg.Broker),
+		handlers.NewErrorHandler(
+			cfg.DataStore,
+			cfg.Broker,
+			cfg.Middleware.Job...,
+		),
 		cfg.Middleware.Task,
 	)
 
@@ -150,8 +166,12 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 		cfg.Middleware.Node,
 	)
 
+	onLogPart := handlers.NewLogHandler(cfg.DataStore)
+
 	return &Coordinator{
-		Name:        name,
+		id:          uuid.NewShortUUID(),
+		startTime:   time.Now(),
+		Name:        cfg.Name,
 		api:         api,
 		broker:      cfg.Broker,
 		ds:          cfg.DataStore,
@@ -162,6 +182,8 @@ func NewCoordinator(cfg Config) (*Coordinator, error) {
 		onJob:       onJob,
 		onHeartbeat: onHeartbeat,
 		onCompleted: onCompleted,
+		onLogPart:   onLogPart,
+		stop:        make(chan any),
 	}, nil
 }
 
@@ -193,7 +215,7 @@ func (c *Coordinator) Start() error {
 				})
 			case mq.QUEUE_STARTED:
 				err = c.broker.SubscribeForTasks(qname, func(t *tork.Task) error {
-					return c.onStarted(context.Background(), task.StateChange, t)
+					return c.onStarted(context.Background(), task.Started, t)
 				})
 			case mq.QUEUE_ERROR:
 				err = c.broker.SubscribeForTasks(qname, func(t *tork.Task) error {
@@ -207,17 +229,23 @@ func (c *Coordinator) Start() error {
 				err = c.broker.SubscribeForJobs(func(j *tork.Job) error {
 					return c.onJob(context.Background(), job.StateChange, j)
 				})
+			case mq.QUEUE_LOGS:
+				err = c.broker.SubscribeForTaskLogPart(func(p *tork.TaskLogPart) {
+					c.onLogPart(p)
+				})
 			}
 			if err != nil {
 				return err
 			}
 		}
 	}
+	go c.sendHeartbeats()
 	return nil
 }
 
 func (c *Coordinator) Stop() error {
 	log.Debug().Msgf("shutting down %s", c.Name)
+	close(c.stop)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := c.broker.Shutdown(ctx); err != nil {
@@ -227,4 +255,38 @@ func (c *Coordinator) Stop() error {
 		return errors.Wrapf(err, "error shutting down API")
 	}
 	return nil
+}
+
+func (c *Coordinator) sendHeartbeats() {
+	for {
+		status := tork.NodeStatusUP
+		hostname, err := os.Hostname()
+		if err != nil {
+			log.Error().Err(err).Msgf("failed to get hostname for coordinator %s", c.id)
+		}
+		cpuPercent := host.GetCPUPercent()
+		err = c.broker.PublishHeartbeat(
+			context.Background(),
+			&tork.Node{
+				ID:              c.id,
+				Name:            c.Name,
+				StartedAt:       c.startTime,
+				Status:          status,
+				CPUPercent:      cpuPercent,
+				LastHeartbeatAt: time.Now().UTC(),
+				Hostname:        hostname,
+				Version:         tork.Version,
+			},
+		)
+		if err != nil {
+			log.Error().
+				Err(err).
+				Msgf("error publishing heartbeat for %s", c.id)
+		}
+		select {
+		case <-c.stop:
+			return
+		case <-time.After(tork.HEARTBEAT_RATE):
+		}
+	}
 }

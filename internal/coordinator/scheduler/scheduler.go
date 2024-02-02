@@ -71,7 +71,7 @@ func (s *Scheduler) scheduleRegularTask(ctx context.Context, t *tork.Task) error
 	if t.Queue == "" {
 		t.Queue = mq.QUEUE_DEFAULT
 	}
-	// mark job state as scheduled
+	// mark task state as scheduled
 	t.State = tork.TaskStateScheduled
 	t.ScheduledAt = &now
 	if err := s.ds.UpdateTask(ctx, t.ID, func(u *tork.Task) error {
@@ -89,6 +89,13 @@ func (s *Scheduler) scheduleRegularTask(ctx context.Context, t *tork.Task) error
 }
 
 func (s *Scheduler) scheduleSubJob(ctx context.Context, t *tork.Task) error {
+	if t.SubJob.Detached {
+		return s.scheduleDetachedSubJob(ctx, t)
+	}
+	return s.scheduleAttachedSubJob(ctx, t)
+}
+
+func (s *Scheduler) scheduleAttachedSubJob(ctx context.Context, t *tork.Task) error {
 	now := time.Now().UTC()
 	subjob := &tork.Job{
 		ID:          uuid.NewUUID(),
@@ -102,6 +109,7 @@ func (s *Scheduler) scheduleSubJob(ctx context.Context, t *tork.Task) error {
 		Context:     tork.JobContext{Inputs: t.SubJob.Inputs},
 		TaskCount:   len(t.SubJob.Tasks),
 		Output:      t.SubJob.Output,
+		Webhooks:    t.SubJob.Webhooks,
 	}
 	if err := s.ds.UpdateTask(ctx, t.ID, func(u *tork.Task) error {
 		u.State = tork.TaskStateRunning
@@ -118,6 +126,41 @@ func (s *Scheduler) scheduleSubJob(ctx context.Context, t *tork.Task) error {
 	return s.broker.PublishJob(ctx, subjob)
 }
 
+func (s *Scheduler) scheduleDetachedSubJob(ctx context.Context, t *tork.Task) error {
+	now := time.Now().UTC()
+	subjob := &tork.Job{
+		ID:          uuid.NewUUID(),
+		CreatedAt:   now,
+		Name:        t.SubJob.Name,
+		Description: t.SubJob.Description,
+		State:       tork.JobStatePending,
+		Tasks:       t.SubJob.Tasks,
+		Inputs:      t.SubJob.Inputs,
+		Context:     tork.JobContext{Inputs: t.SubJob.Inputs},
+		TaskCount:   len(t.SubJob.Tasks),
+		Output:      t.SubJob.Output,
+		Webhooks:    t.SubJob.Webhooks,
+	}
+	if err := s.ds.CreateJob(ctx, subjob); err != nil {
+		return errors.Wrapf(err, "error creating subjob")
+	}
+	if err := s.broker.PublishJob(ctx, subjob); err != nil {
+		return errors.Wrapf(err, "error publishing subjob")
+	}
+	if err := s.ds.UpdateTask(ctx, t.ID, func(u *tork.Task) error {
+		u.State = tork.TaskStateRunning
+		u.ScheduledAt = &now
+		u.StartedAt = &now
+		u.SubJob.ID = subjob.ID
+		return nil
+	}); err != nil {
+		return errors.Wrapf(err, "error updating task in datastore")
+	}
+	t.CompletedAt = &now
+	t.State = tork.TaskStateCompleted
+	return s.broker.PublishTask(ctx, mq.QUEUE_COMPLETED, t)
+}
+
 func (s *Scheduler) scheduleEachTask(ctx context.Context, t *tork.Task) error {
 	now := time.Now().UTC()
 	// get the job's context
@@ -128,7 +171,9 @@ func (s *Scheduler) scheduleEachTask(ctx context.Context, t *tork.Task) error {
 	// evaluate the list expression
 	lraw, err := eval.EvaluateExpr(t.Each.List, j.Context.AsMap())
 	if err != nil {
-		return errors.Wrapf(err, "error evaluating each.list expression: %s", t.Each.List)
+		t.Error = err.Error()
+		t.State = tork.TaskStateFailed
+		return s.broker.PublishTask(ctx, mq.QUEUE_ERROR, t)
 	}
 	var list []any
 	rlist := reflect.ValueOf(lraw)
@@ -137,7 +182,9 @@ func (s *Scheduler) scheduleEachTask(ctx context.Context, t *tork.Task) error {
 			list = append(list, rlist.Index(i).Interface())
 		}
 	} else {
-		return errors.Wrapf(err, "each.list expression does not evaluate to a list: %s", t.Each.List)
+		t.Error = err.Error()
+		t.State = tork.TaskStateFailed
+		return s.broker.PublishTask(ctx, mq.QUEUE_ERROR, t)
 	}
 	// mark the task as running
 	if err := s.ds.UpdateTask(ctx, t.ID, func(u *tork.Task) error {
@@ -152,7 +199,11 @@ func (s *Scheduler) scheduleEachTask(ctx context.Context, t *tork.Task) error {
 	// schedule a task for each elements in the list
 	for ix, item := range list {
 		cx := j.Context.Clone().AsMap()
-		cx["item"] = map[string]any{
+		eachVar := t.Each.Var
+		if eachVar == "" {
+			eachVar = "item"
+		}
+		cx[eachVar] = map[string]any{
 			"index": fmt.Sprintf("%d", ix),
 			"value": item,
 		}

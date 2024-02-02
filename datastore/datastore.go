@@ -3,10 +3,18 @@ package datastore
 import (
 	"context"
 
+	"github.com/pkg/errors"
 	"github.com/runabol/tork"
 )
 
 type Provider func() (Datastore, error)
+
+var (
+	ErrTaskNotFound    = errors.New("task not found")
+	ErrNodeNotFound    = errors.New("node not found")
+	ErrJobNotFound     = errors.New("job not found")
+	ErrContextNotFound = errors.New("context not found")
+)
 
 const (
 	DATASTORE_INMEMORY = "inmemory"
@@ -18,6 +26,8 @@ type Datastore interface {
 	UpdateTask(ctx context.Context, id string, modify func(u *tork.Task) error) error
 	GetTaskByID(ctx context.Context, id string) (*tork.Task, error)
 	GetActiveTasks(ctx context.Context, jobID string) ([]*tork.Task, error)
+	CreateTaskLogPart(ctx context.Context, p *tork.TaskLogPart) error
+	GetTaskLogParts(ctx context.Context, taskID string, page, size int) (*Page[*tork.TaskLogPart], error)
 
 	CreateNode(ctx context.Context, n *tork.Node) error
 	UpdateNode(ctx context.Context, id string, modify func(u *tork.Node) error) error

@@ -3,6 +3,7 @@ package conf_test
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/runabol/tork/conf"
 	"github.com/stretchr/testify/assert"
@@ -20,6 +21,7 @@ func TestLoadConfigNotExistUserDefined(t *testing.T) {
 	}()
 	err := conf.LoadConfig()
 	assert.Error(t, err)
+	assert.ErrorContains(t, err, "could not find config file in: no.such.thing")
 }
 
 func TestLoadConfigBadContents(t *testing.T) {
@@ -56,6 +58,35 @@ func TestString(t *testing.T) {
 	err = conf.LoadConfig()
 	assert.NoError(t, err)
 	assert.Equal(t, "value1", conf.String("main.key1"))
+}
+
+func TestStrings(t *testing.T) {
+	konf := `
+	[main]
+	keys = ["value1"]
+	`
+	err := os.WriteFile("config_strings.toml", []byte(konf), os.ModePerm)
+	assert.NoError(t, err)
+	defer func() {
+		assert.NoError(t, os.Remove("config_strings.toml"))
+	}()
+	os.Setenv("TORK_CONFIG", "config_strings.toml")
+	defer func() {
+		os.Unsetenv("TORK_CONFIG")
+	}()
+	err = conf.LoadConfig()
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"value1"}, conf.Strings("main.keys"))
+}
+
+func TestStringsEnv(t *testing.T) {
+	os.Setenv("TORK_MAIN_STRINGS_KEYS", "a,b,c")
+	defer func() {
+		os.Unsetenv("TORK_MAIN_STRINGS_KEYS")
+	}()
+	err := conf.LoadConfig()
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c"}, conf.Strings("main.strings.keys"))
 }
 
 func TestStringDefault(t *testing.T) {
@@ -101,6 +132,32 @@ func TestLoadConfigCustomPath(t *testing.T) {
 	}()
 	err = conf.LoadConfig()
 	assert.Error(t, err)
+}
+
+func TestLoadConfigWithOverridingEnv(t *testing.T) {
+	konf := `
+	[main]
+	key1 = "value1"
+	key3 = "value3"
+	`
+	err := os.WriteFile("config_with_override.toml", []byte(konf), os.ModePerm)
+	assert.NoError(t, err)
+	defer func() {
+		assert.NoError(t, os.Remove("config_with_override.toml"))
+	}()
+	os.Setenv("TORK_CONFIG", "config_with_override.toml")
+	defer func() {
+		os.Unsetenv("TORK_CONFIG")
+	}()
+	assert.NoError(t, os.Setenv("TORK_MAIN_KEY1", "value2"))
+	defer func() {
+		assert.NoError(t, os.Unsetenv("TORK_MAIN_KEY1"))
+	}()
+	err = conf.LoadConfig()
+	assert.NoError(t, err)
+
+	assert.Equal(t, "value2", conf.String("main.key1"))
+	assert.Equal(t, "value3", conf.String("main.key3"))
 }
 
 func TestLoadConfigEnv(t *testing.T) {
@@ -160,6 +217,23 @@ func TestBoolDefault(t *testing.T) {
 	assert.False(t, conf.BoolDefault("main.enabled", true))
 	assert.False(t, conf.BoolDefault("main.enabled", false))
 	assert.True(t, conf.BoolDefault("main.other", true))
+}
+
+func TestDurationDefault(t *testing.T) {
+	konf := `
+	[main]
+	some.duration = "5m"
+	`
+	err := os.WriteFile("config.toml", []byte(konf), os.ModePerm)
+	assert.NoError(t, err)
+	defer func() {
+		assert.NoError(t, os.Remove("config.toml"))
+	}()
+	err = conf.LoadConfig()
+
+	assert.NoError(t, err)
+	assert.Equal(t, time.Minute*5, conf.DurationDefault("main.some.duration", time.Minute))
+	assert.Equal(t, time.Minute, conf.DurationDefault("main.other.duration", time.Minute))
 }
 
 func TestBoolMap(t *testing.T) {

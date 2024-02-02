@@ -77,7 +77,7 @@ func Test_handleTaskRun(t *testing.T) {
 
 	t1 := &tork.Task{
 		ID:    uuid.NewUUID(),
-		State: tork.TaskStateScheduled,
+		State: tork.TaskStateRunning,
 		Image: "ubuntu:mantic",
 		CMD:   []string{"ls"},
 		Mounts: []tork.Mount{
@@ -112,7 +112,7 @@ func Test_handleTaskRunOutput(t *testing.T) {
 
 	t1 := &tork.Task{
 		ID:    uuid.NewUUID(),
-		State: tork.TaskStateScheduled,
+		State: tork.TaskStateRunning,
 		Image: "alpine:3.18.3",
 		Run:   "echo -n hello world > $TORK_OUTPUT",
 	}
@@ -150,7 +150,7 @@ func Test_handleTaskRunWithPrePost(t *testing.T) {
 
 	t1 := &tork.Task{
 		ID:    uuid.NewUUID(),
-		State: tork.TaskStateScheduled,
+		State: tork.TaskStateRunning,
 		Image: "ubuntu:mantic",
 		Run:   "cat /somevolume/pre > $TORK_OUTPUT",
 		Mounts: []tork.Mount{
@@ -222,7 +222,7 @@ func Test_handleTaskCancel(t *testing.T) {
 
 	err = w.handleTask(&tork.Task{
 		ID:    tid,
-		State: tork.TaskStateScheduled,
+		State: tork.TaskStateRunning,
 		Image: "ubuntu:mantic",
 		CMD:   []string{"sleep", "10"},
 	})
@@ -256,7 +256,7 @@ func Test_handleTaskError(t *testing.T) {
 
 	err = w.handleTask(&tork.Task{
 		ID:    uuid.NewUUID(),
-		State: tork.TaskStateScheduled,
+		State: tork.TaskStateRunning,
 		Image: "ubuntu:mantic",
 		CMD:   []string{"no_such_thing"},
 	})
@@ -291,7 +291,7 @@ func Test_handleTaskOutput(t *testing.T) {
 
 	err = w.handleTask(&tork.Task{
 		ID:    uuid.NewUUID(),
-		State: tork.TaskStateScheduled,
+		State: tork.TaskStateRunning,
 		Image: "ubuntu:mantic",
 		Run:   "echo -n 'hello world' >> $TORK_OUTPUT",
 	})
@@ -353,13 +353,11 @@ func Test_middleware(t *testing.T) {
 func Test_sendHeartbeat(t *testing.T) {
 	rt, err := docker.NewDockerRuntime()
 	assert.NoError(t, err)
-
 	b := mq.NewInMemoryBroker()
-
 	heartbeats := make(chan any)
 	err = b.SubscribeForHeartbeats(func(n *tork.Node) error {
 		assert.Contains(t, n.Version, tork.Version)
-		close(heartbeats)
+		heartbeats <- 1
 		return nil
 	})
 	assert.NoError(t, err)
@@ -375,4 +373,117 @@ func Test_sendHeartbeat(t *testing.T) {
 
 	<-heartbeats
 	assert.NoError(t, w.Stop())
+}
+
+func Test_handleTaskRunDefaultLimitExceeded(t *testing.T) {
+	rt, err := docker.NewDockerRuntime()
+	assert.NoError(t, err)
+
+	b := mq.NewInMemoryBroker()
+
+	w, err := NewWorker(Config{
+		Broker:  b,
+		Runtime: rt,
+		Limits: Limits{
+			DefaultTimeout: "1s",
+		},
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, w)
+
+	errors := make(chan any)
+	err = b.SubscribeForTasks(mq.QUEUE_ERROR, func(tk *tork.Task) error {
+		assert.Contains(t, tk.Error, "context deadline exceeded")
+		close(errors)
+		return nil
+	})
+	assert.NoError(t, err)
+
+	starts := make(chan any)
+	err = b.SubscribeForTasks(mq.QUEUE_STARTED, func(tk *tork.Task) error {
+		assert.Equal(t, int32(1), atomic.LoadInt32(&w.taskCount))
+		close(starts)
+		return nil
+	})
+	assert.NoError(t, err)
+
+	err = w.Start()
+	assert.NoError(t, err)
+
+	t1 := &tork.Task{
+		ID:    uuid.NewUUID(),
+		State: tork.TaskStateRunning,
+		Image: "ubuntu:mantic",
+		CMD:   []string{"sleep", "5"},
+		Mounts: []tork.Mount{
+			{
+				Type:   tork.MountTypeVolume,
+				Target: "/somevolume",
+			},
+		},
+	}
+
+	err = w.handleTask(t1)
+
+	<-starts
+	<-errors
+
+	assert.NoError(t, err)
+	assert.Equal(t, "/somevolume", t1.Mounts[0].Target)
+}
+
+func Test_handleTaskRunDefaultLimitOK(t *testing.T) {
+	rt, err := docker.NewDockerRuntime()
+	assert.NoError(t, err)
+
+	b := mq.NewInMemoryBroker()
+
+	w, err := NewWorker(Config{
+		Broker:  b,
+		Runtime: rt,
+		Limits: Limits{
+			DefaultTimeout: "5s",
+		},
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, w)
+
+	completions := make(chan any)
+	err = b.SubscribeForTasks(mq.QUEUE_COMPLETED, func(tk *tork.Task) error {
+		close(completions)
+		return nil
+	})
+	assert.NoError(t, err)
+
+	starts := make(chan any)
+	err = b.SubscribeForTasks(mq.QUEUE_STARTED, func(tk *tork.Task) error {
+		assert.Equal(t, int32(1), atomic.LoadInt32(&w.taskCount))
+		close(starts)
+		return nil
+	})
+	assert.NoError(t, err)
+
+	err = w.Start()
+	assert.NoError(t, err)
+
+	t1 := &tork.Task{
+		ID:    uuid.NewUUID(),
+		State: tork.TaskStateRunning,
+		Image: "ubuntu:mantic",
+		CMD:   []string{"sleep", "1"},
+		Mounts: []tork.Mount{
+			{
+				Type:   tork.MountTypeVolume,
+				Target: "/somevolume",
+			},
+		},
+	}
+
+	err = w.handleTask(t1)
+
+	<-starts
+	<-completions
+
+	assert.NoError(t, err)
+	assert.Equal(t, "/somevolume", t1.Mounts[0].Target)
 }

@@ -19,6 +19,10 @@ import (
 )
 
 const (
+	RABBITMQ_DEFAULT_CONSUMER_TIMEOUT = time.Minute * 30
+)
+
+const (
 	exchangeTopic       = "amq.topic"
 	exchangeDefault     = ""
 	keyDefault          = ""
@@ -26,15 +30,17 @@ const (
 )
 
 type RabbitMQBroker struct {
-	connPool      []*amqp.Connection
-	nextConn      int
-	queues        *syncx.Map[string, string]
-	topics        *syncx.Map[string, string]
-	subscriptions []*subscription
-	mu            sync.RWMutex
-	url           string
-	shuttingDown  bool
-	heartbeatTTL  int
+	connPool        []*amqp.Connection
+	nextConn        int
+	queues          *syncx.Map[string, string]
+	topics          *syncx.Map[string, string]
+	subscriptions   []*subscription
+	mu              sync.RWMutex
+	url             string
+	shuttingDown    bool
+	heartbeatTTL    int
+	consumerTimeout int
+	managementURL   string
 }
 
 type subscription struct {
@@ -42,6 +48,14 @@ type subscription struct {
 	ch    *amqp.Channel
 	name  string
 	done  chan int
+}
+
+type rabbitq struct {
+	Name      string         `json:"name"`
+	Messages  int            `json:"messages"`
+	Consumers int            `json:"consumers"`
+	Unacked   int            `json:"messages_unacknowledged"`
+	Arguments map[string]any `json:"arguments"`
 }
 
 type Option = func(b *RabbitMQBroker)
@@ -55,6 +69,22 @@ func WithHeartbeatTTL(ttl int) Option {
 	}
 }
 
+// WithConsumerTimeout sets the maximum amount of time in
+// RabbitMQ will wait for a message ack before from a consumer
+// before deeming the message undelivered and shuting down the
+// connection. Default: 30 minutes
+func WithConsumerTimeoutMS(consumerTimeout time.Duration) Option {
+	return func(b *RabbitMQBroker) {
+		b.consumerTimeout = int(consumerTimeout.Milliseconds())
+	}
+}
+
+func WithManagementURL(url string) Option {
+	return func(b *RabbitMQBroker) {
+		b.managementURL = url
+	}
+}
+
 func NewRabbitMQBroker(url string, opts ...Option) (*RabbitMQBroker, error) {
 	connPool := make([]*amqp.Connection, 3)
 	for i := 0; i < len(connPool); i++ {
@@ -65,12 +95,13 @@ func NewRabbitMQBroker(url string, opts ...Option) (*RabbitMQBroker, error) {
 		connPool[i] = conn
 	}
 	b := &RabbitMQBroker{
-		queues:        new(syncx.Map[string, string]),
-		topics:        new(syncx.Map[string, string]),
-		url:           url,
-		connPool:      connPool,
-		subscriptions: make([]*subscription, 0),
-		heartbeatTTL:  defaultHeartbeatTTL,
+		queues:          new(syncx.Map[string, string]),
+		topics:          new(syncx.Map[string, string]),
+		url:             url,
+		connPool:        connPool,
+		subscriptions:   make([]*subscription, 0),
+		heartbeatTTL:    defaultHeartbeatTTL,
+		consumerTimeout: int(RABBITMQ_DEFAULT_CONSUMER_TIMEOUT.Milliseconds()),
 	}
 	for _, o := range opts {
 		o(b)
@@ -79,36 +110,10 @@ func NewRabbitMQBroker(url string, opts ...Option) (*RabbitMQBroker, error) {
 }
 
 func (b *RabbitMQBroker) Queues(ctx context.Context) ([]QueueInfo, error) {
-	u, err := url.Parse(b.url)
+	rqs, err := b.rabbitQueues(ctx)
 	if err != nil {
-		return nil, errors.Wrapf(err, "unable to parse url: %s", b.url)
+		return nil, err
 	}
-	manager := fmt.Sprintf("http://%s:15672/api/queues/", u.Hostname())
-	client := &http.Client{}
-	req, err := http.NewRequestWithContext(ctx, "GET", manager, nil)
-	if err != nil {
-		return nil, errors.Wrapf(err, "unable to build get queues request")
-	}
-	pw, _ := u.User.Password()
-	req.SetBasicAuth(u.User.Username(), pw)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, errors.Wrapf(err, "error getting rabbitmq queues from the API")
-	}
-
-	type rabbitq struct {
-		Name      string `json:"name"`
-		Messages  int    `json:"messages"`
-		Consumers int    `json:"consumers"`
-		Unacked   int    `json:"messages_unacknowledged"`
-	}
-
-	rqs := make([]rabbitq, 0)
-	err = json.NewDecoder(resp.Body).Decode(&rqs)
-	if err != nil {
-		return nil, errors.Wrapf(err, "error unmarshalling API response")
-	}
-
 	qis := make([]QueueInfo, len(rqs))
 	for i, rq := range rqs {
 		qis[i] = QueueInfo{
@@ -118,8 +123,37 @@ func (b *RabbitMQBroker) Queues(ctx context.Context) ([]QueueInfo, error) {
 			Unacked:     rq.Unacked,
 		}
 	}
-
 	return qis, nil
+}
+
+func (b *RabbitMQBroker) rabbitQueues(ctx context.Context) ([]rabbitq, error) {
+	u, err := url.Parse(b.url)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to parse url: %s", b.url)
+	}
+	var endpoint string
+	if b.managementURL != "" {
+		endpoint = fmt.Sprintf("%s/api/queues/", b.managementURL)
+	} else {
+		endpoint = fmt.Sprintf("http://%s:15672/api/queues/", u.Hostname())
+	}
+	client := &http.Client{}
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to build get queues request")
+	}
+	pw, _ := u.User.Password()
+	req.SetBasicAuth(u.User.Username(), pw)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error getting rabbitmq queues from the API")
+	}
+	rqs := make([]rabbitq, 0)
+	err = json.NewDecoder(resp.Body).Decode(&rqs)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error unmarshalling API response")
+	}
+	return rqs, nil
 }
 
 func (b *RabbitMQBroker) PublishTask(ctx context.Context, qname string, t *tork.Task) error {
@@ -135,9 +169,6 @@ func (b *RabbitMQBroker) PublishTask(ctx context.Context, qname string, t *tork.
 		return errors.Wrapf(err, "error creating channel")
 	}
 	defer ch.Close()
-	if err := b.declareQueue(exchangeDefault, keyDefault, qname, ch); err != nil {
-		return errors.Wrapf(err, "error (re)declaring queue")
-	}
 	return b.publish(ctx, exchangeDefault, qname, t)
 }
 
@@ -238,7 +269,7 @@ func (b *RabbitMQBroker) subscribe(exchange, key, qname string, handler func(msg
 
 func serialize(msg any) ([]byte, error) {
 	mtype := fmt.Sprintf("%T", msg)
-	if mtype != "*tork.Task" && mtype != "*tork.Job" && mtype != "*tork.Node" {
+	if mtype != "*tork.Task" && mtype != "*tork.Job" && mtype != "*tork.Node" && mtype != "*tork.TaskLogPart" {
 		return nil, errors.Errorf("unnknown type: %T", msg)
 	}
 	body, err := json.Marshal(msg)
@@ -268,6 +299,12 @@ func deserialize(tname string, body []byte) (any, error) {
 			return nil, err
 		}
 		return &n, nil
+	case "*tork.TaskLogPart":
+		p := tork.TaskLogPart{}
+		if err := json.Unmarshal(body, &p); err != nil {
+			return nil, err
+		}
+		return &p, nil
 	}
 	return nil, errors.Errorf("unknown message type: %s", tname)
 }
@@ -277,40 +314,29 @@ func (b *RabbitMQBroker) declareQueue(exchange, key, qname string, ch *amqp.Chan
 	if ok {
 		return nil
 	}
-	// get a list of existing queues
-	qs, err := b.Queues(context.Background())
+	log.Debug().Msgf("declaring queue: %s", qname)
+	args := amqp.Table{}
+	if qname == QUEUE_HEARTBEAT {
+		args["x-message-ttl"] = b.heartbeatTTL
+	}
+	args["x-consumer-timeout"] = b.consumerTimeout
+	_, err := ch.QueueDeclare(
+		qname,
+		false, // durable
+		false, // delete when unused
+		strings.HasPrefix(qname, QUEUE_EXCLUSIVE_PREFIX), // exclusive
+		false, // no-wait
+		args,  // arguments
+	)
 	if err != nil {
 		return err
 	}
-	exists := false
-	for _, q := range qs {
-		if q.Name == qname {
-			exists = true
-		}
-	}
-	if !exists {
-		log.Debug().Msgf("declaring queue: %s", qname)
-		args := amqp.Table{}
-		if qname == QUEUE_HEARTBEAT {
-			args["x-message-ttl"] = b.heartbeatTTL
-		}
-		_, err = ch.QueueDeclare(
-			qname,
-			false, // durable
-			false, // delete when unused
-			strings.HasPrefix(qname, QUEUE_EXCLUSIVE_PREFIX), // exclusive
-			false, // no-wait
-			args,  // arguments
-		)
-		if err != nil {
+	if exchange != exchangeDefault {
+		if err := ch.QueueBind(qname, key, exchange, false, nil); err != nil {
 			return err
 		}
-		if exchange != exchangeDefault {
-			if err := ch.QueueBind(qname, key, exchange, false, nil); err != nil {
-				return err
-			}
-		}
 	}
+
 	b.queues.Set(qname, qname)
 	return nil
 }
@@ -490,4 +516,19 @@ func (b *RabbitMQBroker) HealthCheck(ctx context.Context) error {
 	}
 	defer ch.Close()
 	return nil
+}
+
+func (b *RabbitMQBroker) PublishTaskLogPart(ctx context.Context, p *tork.TaskLogPart) error {
+	return b.publish(ctx, exchangeDefault, QUEUE_LOGS, p)
+}
+
+func (b *RabbitMQBroker) SubscribeForTaskLogPart(handler func(p *tork.TaskLogPart)) error {
+	return b.subscribe(exchangeDefault, keyDefault, QUEUE_LOGS, func(msg any) error {
+		p, ok := msg.(*tork.TaskLogPart)
+		if !ok {
+			return errors.Errorf("expecting a *tork.TaskLogPart but got %T", msg)
+		}
+		handler(p)
+		return nil
+	})
 }

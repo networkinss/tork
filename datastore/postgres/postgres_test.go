@@ -1,4 +1,4 @@
-package datastore
+package postgres
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/runabol/tork"
+	"github.com/runabol/tork/datastore"
 	"github.com/runabol/tork/db/postgres"
 
 	"github.com/runabol/tork/internal/uuid"
@@ -35,6 +36,9 @@ func TestPostgresCreateAndGetTask(t *testing.T) {
 		Networks:    []string{"some-network"},
 		Files:       map[string]string{"myfile": "hello world"},
 		Registry:    &tork.Registry{Username: "me", Password: "secret"},
+		GPUs:        "all",
+		If:          "true",
+		Tags:        []string{"tag1", "tag2"},
 	}
 	err = ds.CreateTask(ctx, &t1)
 	assert.NoError(t, err)
@@ -46,6 +50,40 @@ func TestPostgresCreateAndGetTask(t *testing.T) {
 	assert.Equal(t, map[string]string{"myfile": "hello world"}, t2.Files)
 	assert.Equal(t, "me", t2.Registry.Username)
 	assert.Equal(t, "secret", t2.Registry.Password)
+	assert.Equal(t, "all", t2.GPUs)
+	assert.Equal(t, "true", t2.If)
+	assert.Nil(t, t2.Parallel)
+	assert.Equal(t, []string([]string{"tag1", "tag2"}), t2.Tags)
+}
+
+func TestPostgresCreateAndGetParallelTask(t *testing.T) {
+	ctx := context.Background()
+	dsn := "host=localhost user=tork password=tork dbname=tork port=5432 sslmode=disable"
+	ds, err := NewPostgresDataStore(dsn)
+	assert.NoError(t, err)
+	now := time.Now().UTC()
+	j1 := tork.Job{
+		ID: uuid.NewUUID(),
+	}
+	err = ds.CreateJob(ctx, &j1)
+	assert.NoError(t, err)
+	t1 := tork.Task{
+		ID:        uuid.NewUUID(),
+		CreatedAt: &now,
+		JobID:     j1.ID,
+		Parallel: &tork.ParallelTask{
+			Tasks: []*tork.Task{{
+				Name: "parallel task1",
+			}, {
+				Name: "parallel task2",
+			}},
+		},
+	}
+	err = ds.CreateTask(ctx, &t1)
+	assert.NoError(t, err)
+	t2, err := ds.GetTaskByID(ctx, t1.ID)
+	assert.NoError(t, err)
+	assert.NotNil(t, t2.Parallel)
 }
 
 func TestPostgresCreateTaskBadOutput(t *testing.T) {
@@ -248,6 +286,7 @@ func TestPostgresCreateAndGetNode(t *testing.T) {
 	assert.NoError(t, err)
 	n1 := &tork.Node{
 		ID:       uuid.NewUUID(),
+		Name:     "some node",
 		Hostname: "some-name",
 		Version:  "1.0.0",
 	}
@@ -258,6 +297,7 @@ func TestPostgresCreateAndGetNode(t *testing.T) {
 	assert.Equal(t, n1.ID, n2.ID)
 	assert.Equal(t, "some-name", n2.Hostname)
 	assert.Equal(t, "1.0.0", n2.Version)
+	assert.Equal(t, "some node", n2.Name)
 }
 
 func TestPostgresUpdateNode(t *testing.T) {
@@ -393,6 +433,21 @@ func TestPostgresCreateAndGetJob(t *testing.T) {
 				Memory: "10MB",
 			},
 		},
+		Webhooks: []*tork.Webhook{
+			{
+				URL: "http://example.com/1",
+				Headers: map[string]string{
+					"header1": "value1",
+				},
+			},
+			{
+				URL: "http://example.com/2",
+				Headers: map[string]string{
+					"header1": "value1",
+				},
+				Event: "job.StatusChange",
+			},
+		},
 	}
 	err = ds.CreateJob(ctx, &j1)
 	assert.NoError(t, err)
@@ -404,6 +459,9 @@ func TestPostgresCreateAndGetJob(t *testing.T) {
 	assert.Equal(t, 2, j2.Defaults.Retry.Limit)
 	assert.Equal(t, ".5", j2.Defaults.Limits.CPUs)
 	assert.Equal(t, "10MB", j2.Defaults.Limits.Memory)
+	assert.Len(t, j2.Webhooks, 2)
+	assert.Equal(t, j1.Webhooks[0], j2.Webhooks[0])
+	assert.Equal(t, j1.Webhooks[1], j2.Webhooks[1])
 }
 
 func TestPostgresUpdateJob(t *testing.T) {
@@ -670,7 +728,7 @@ func TestPostgresWithTxCreateTask(t *testing.T) {
 	j1 := tork.Job{
 		ID: uuid.NewUUID(),
 	}
-	err = ds.WithTx(ctx, func(tx Datastore) error {
+	err = ds.WithTx(ctx, func(tx datastore.Datastore) error {
 		err = tx.CreateJob(ctx, &j1)
 		assert.NoError(t, err)
 		t1 := tork.Task{}
@@ -703,7 +761,7 @@ func TestPostgresWithTxUpdateTask(t *testing.T) {
 	}
 	err = ds.CreateTask(ctx, &t1)
 	assert.NoError(t, err)
-	err = ds.WithTx(ctx, func(tx Datastore) error {
+	err = ds.WithTx(ctx, func(tx datastore.Datastore) error {
 		return tx.UpdateTask(ctx, t1.ID, func(u *tork.Task) error {
 			u.State = tork.TaskStateFailed
 			u.State = tork.TaskState(strings.Repeat("x", 100)) // invalid state
@@ -739,4 +797,214 @@ func TestPostgresHealthCheck(t *testing.T) {
 
 	err = ds.HealthCheck(ctx)
 	assert.Error(t, err)
+}
+
+func TestPostgresCreateAndGetTaskLogs(t *testing.T) {
+	ctx := context.Background()
+	dsn := "host=localhost user=tork password=tork dbname=tork port=5432 sslmode=disable"
+	ds, err := NewPostgresDataStore(dsn)
+	assert.NoError(t, err)
+	now := time.Now().UTC()
+	j1 := tork.Job{
+		ID: uuid.NewUUID(),
+	}
+	err = ds.CreateJob(ctx, &j1)
+	assert.NoError(t, err)
+	t1 := tork.Task{
+		ID:        uuid.NewUUID(),
+		CreatedAt: &now,
+		JobID:     j1.ID,
+	}
+	err = ds.CreateTask(ctx, &t1)
+	assert.NoError(t, err)
+
+	err = ds.CreateTaskLogPart(ctx, &tork.TaskLogPart{
+		Number:   1,
+		TaskID:   t1.ID,
+		Contents: "line 1",
+	})
+	assert.NoError(t, err)
+
+	logs, err := ds.GetTaskLogParts(ctx, t1.ID, 1, 10)
+	assert.NoError(t, err)
+	assert.Len(t, logs.Items, 1)
+	assert.Equal(t, "line 1", logs.Items[0].Contents)
+}
+
+func TestPostgresCreateAndGetTaskLogsMultiParts(t *testing.T) {
+	ctx := context.Background()
+	dsn := "host=localhost user=tork password=tork dbname=tork port=5432 sslmode=disable"
+	ds, err := NewPostgresDataStore(dsn)
+	assert.NoError(t, err)
+	now := time.Now().UTC()
+	j1 := tork.Job{
+		ID: uuid.NewUUID(),
+	}
+	err = ds.CreateJob(ctx, &j1)
+	assert.NoError(t, err)
+	t1 := tork.Task{
+		ID:        uuid.NewUUID(),
+		CreatedAt: &now,
+		JobID:     j1.ID,
+	}
+	err = ds.CreateTask(ctx, &t1)
+	assert.NoError(t, err)
+
+	parts := 10
+
+	wg := sync.WaitGroup{}
+	wg.Add(parts)
+
+	for i := 1; i <= parts; i++ {
+		go func(n int) {
+			defer wg.Done()
+			err := ds.CreateTaskLogPart(ctx, &tork.TaskLogPart{
+				Number:   n,
+				TaskID:   t1.ID,
+				Contents: fmt.Sprintf("line %d", n),
+			})
+			assert.NoError(t, err)
+		}(i)
+	}
+
+	wg.Wait()
+
+	logs, err := ds.GetTaskLogParts(ctx, t1.ID, 1, 10)
+	assert.NoError(t, err)
+	assert.Len(t, logs.Items, 10)
+	assert.Equal(t, "line 10", logs.Items[0].Contents)
+	assert.Equal(t, "line 1", logs.Items[9].Contents)
+}
+
+func TestPostgresCreateAndGetTaskLogsLarge(t *testing.T) {
+	ctx := context.Background()
+	dsn := "host=localhost user=tork password=tork dbname=tork port=5432 sslmode=disable"
+	ds, err := NewPostgresDataStore(dsn)
+	assert.NoError(t, err)
+	now := time.Now().UTC()
+	j1 := tork.Job{
+		ID: uuid.NewUUID(),
+	}
+	err = ds.CreateJob(ctx, &j1)
+	assert.NoError(t, err)
+	t1 := tork.Task{
+		ID:        uuid.NewUUID(),
+		CreatedAt: &now,
+		JobID:     j1.ID,
+	}
+	err = ds.CreateTask(ctx, &t1)
+	assert.NoError(t, err)
+
+	for i := 1; i <= 100; i++ {
+		err := ds.CreateTaskLogPart(ctx, &tork.TaskLogPart{
+			Number:   i,
+			TaskID:   t1.ID,
+			Contents: fmt.Sprintf("line %d", i),
+		})
+		assert.NoError(t, err)
+	}
+
+	logs, err := ds.GetTaskLogParts(ctx, t1.ID, 1, 10)
+	assert.NoError(t, err)
+	assert.Len(t, logs.Items, 10)
+	assert.Equal(t, "line 100", logs.Items[0].Contents)
+	assert.Equal(t, "line 91", logs.Items[9].Contents)
+	assert.Equal(t, 10, logs.Size)
+	assert.Equal(t, 10, logs.TotalPages)
+}
+
+func TestPostgresCreateAndExpungeTaskLogs(t *testing.T) {
+	ctx := context.Background()
+	dsn := "host=localhost user=tork password=tork dbname=tork port=5432 sslmode=disable"
+	ds, err := NewPostgresDataStore(dsn)
+	assert.NoError(t, err)
+	now := time.Now().UTC()
+	j1 := tork.Job{
+		ID: uuid.NewUUID(),
+	}
+	err = ds.CreateJob(ctx, &j1)
+	assert.NoError(t, err)
+	t1 := tork.Task{
+		ID:        uuid.NewUUID(),
+		CreatedAt: &now,
+		JobID:     j1.ID,
+	}
+	err = ds.CreateTask(ctx, &t1)
+	assert.NoError(t, err)
+
+	for i := 1; i <= 100; i++ {
+		err := ds.CreateTaskLogPart(ctx, &tork.TaskLogPart{
+			Number:   i,
+			TaskID:   t1.ID,
+			Contents: fmt.Sprintf("line %d", i),
+		})
+		assert.NoError(t, err)
+	}
+
+	n, err := ds.expungeExpiredTaskLogPart()
+	assert.NoError(t, err)
+	assert.Equal(t, 0, n)
+
+	logs, err := ds.GetTaskLogParts(ctx, t1.ID, 1, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, 100, logs.TotalItems)
+
+	retentionPeriod := time.Microsecond
+	ds.taskLogsRetentionPeriod = &retentionPeriod
+
+	n, err = ds.expungeExpiredTaskLogPart()
+	assert.NoError(t, err)
+	assert.GreaterOrEqual(t, n, 100)
+
+	logs, err = ds.GetTaskLogParts(ctx, t1.ID, 1, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, logs.TotalItems)
+}
+
+func Test_cleanup(t *testing.T) {
+	ctx := context.Background()
+	dsn := "host=localhost user=tork password=tork dbname=tork port=5432 sslmode=disable"
+	ds, err := NewPostgresDataStore(dsn, WithDisableCleanup(true))
+	assert.NoError(t, err)
+	now := time.Now().UTC()
+	j1 := tork.Job{
+		ID: uuid.NewUUID(),
+	}
+	err = ds.CreateJob(ctx, &j1)
+	assert.NoError(t, err)
+	t1 := tork.Task{
+		ID:        uuid.NewUUID(),
+		CreatedAt: &now,
+		JobID:     j1.ID,
+	}
+	err = ds.CreateTask(ctx, &t1)
+	assert.NoError(t, err)
+
+	for i := 1; i <= 100; i++ {
+		err := ds.CreateTaskLogPart(ctx, &tork.TaskLogPart{
+			Number:   i,
+			TaskID:   t1.ID,
+			Contents: fmt.Sprintf("line %d", i),
+		})
+		assert.NoError(t, err)
+	}
+
+	err = ds.cleanup()
+	assert.NoError(t, err)
+	assert.Equal(t, time.Minute*2, *ds.cleanupInterval)
+
+	logs, err := ds.GetTaskLogParts(ctx, t1.ID, 1, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, 100, logs.TotalItems)
+
+	retentionPeriod := time.Microsecond
+	ds.taskLogsRetentionPeriod = &retentionPeriod
+
+	err = ds.cleanup()
+	assert.NoError(t, err)
+	assert.Equal(t, time.Minute, *ds.cleanupInterval)
+
+	logs, err = ds.GetTaskLogParts(ctx, t1.ID, 1, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, logs.TotalItems)
 }

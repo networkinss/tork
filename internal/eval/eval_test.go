@@ -42,6 +42,23 @@ func TestEvalVar(t *testing.T) {
 	assert.Equal(t, "SOME DATA", t1.Env["HELLO"])
 }
 
+func TestEvalMapVal(t *testing.T) {
+	t1 := &tork.Task{
+		Env: map[string]string{
+			"HELLO": `{{inputs.SOMEMAP.somekey}}`,
+		},
+	}
+	err := eval.EvaluateTask(t1, map[string]any{
+		"inputs": map[string]any{
+			"SOMEMAP": map[string]string{
+				"somekey": "someval",
+			},
+		},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "someval", t1.Env["HELLO"])
+}
+
 func TestEvalName(t *testing.T) {
 	t1 := &tork.Task{
 		Name: "{{ inputs.SOMENAME }}y",
@@ -190,6 +207,49 @@ func TestEvalParallel(t *testing.T) {
 	assert.Equal(t, "SOME DATA", t1.Parallel.Tasks[0].Env["HELLO"])
 }
 
+func TestEvalCMD(t *testing.T) {
+	t1 := &tork.Task{
+		CMD: []string{"{{ inputs.VAR1 }}", "{{ inputs.VAR2 }}", "VAL3"},
+	}
+	err := eval.EvaluateTask(t1, map[string]any{
+		"inputs": map[string]string{
+			"VAR1": "VAL1",
+			"VAR2": "VAL2",
+		},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"VAL1", "VAL2", "VAL3"}, t1.CMD)
+}
+
+func TestEvalSubjob(t *testing.T) {
+	t1 := &tork.Task{
+		SubJob: &tork.SubJobTask{
+			Name: "some name {{ inputs.VAR1 }}",
+			Inputs: map[string]string{
+				"input1": "{{inputs.VAR1}}",
+				"input2": "{{inputs.VAR2}}",
+			},
+			Webhooks: []*tork.Webhook{{
+				URL: "{{inputs.VAR1}}",
+				Headers: map[string]string{
+					"somekey": "{{inputs.VAR2}}",
+				},
+			}},
+		},
+	}
+	err := eval.EvaluateTask(t1, map[string]any{
+		"inputs": map[string]string{
+			"VAR1": "VAL1",
+			"VAR2": "VAL2",
+		},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "some name VAL1", t1.SubJob.Name)
+	assert.Equal(t, "VAL1", t1.SubJob.Inputs["input1"])
+	assert.Equal(t, "VAL1", t1.SubJob.Webhooks[0].URL)
+	assert.Equal(t, "VAL2", t1.SubJob.Webhooks[0].Headers["somekey"])
+}
+
 func TestEvalExpr(t *testing.T) {
 	v, err := eval.EvaluateExpr("1+1", map[string]any{})
 	assert.NoError(t, err)
@@ -214,6 +274,18 @@ func TestEvalExpr(t *testing.T) {
 	}})
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]any(map[string]any{"hello": "world"}), v)
+
+	v, err = eval.EvaluateExpr("{{ split( inputs.lines, ',' ) }}", map[string]any{"inputs": map[string]string{
+		"lines": "a,b,c",
+	}})
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c"}, v)
+
+	v, err = eval.EvaluateExpr("{{ split( inputs.lines, '\\n' ) }}", map[string]any{"inputs": map[string]string{
+		"lines": "a\nb\nc",
+	}})
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c"}, v)
 }
 
 func TestValidExpr(t *testing.T) {

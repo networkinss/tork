@@ -113,6 +113,7 @@ func NewAPI(cfg Config) (*API, error) {
 	}
 	if v, ok := cfg.Enabled["tasks"]; !ok || v {
 		r.GET("/tasks/:id", s.getTask)
+		r.GET("/tasks/:id/log", s.getTaskLog)
 	}
 	if v, ok := cfg.Enabled["queues"]; !ok || v {
 		r.GET("/queues", s.listQueues)
@@ -392,6 +393,52 @@ func (s *API) getTask(c echo.Context) error {
 	return c.JSON(http.StatusOK, t)
 }
 
+// getTaskLog
+// @Summary Get a task's log
+// @Tags tasks
+// @Produce application/json
+// @Success 200 {object} []tork.TaskLogPart
+// @Router /tasks/{id}/log [get]
+// @Param id path string true "Task ID"
+// @Param page query int false "page number"
+// @Param size query int false "page size"
+func (s *API) getTaskLog(c echo.Context) error {
+	id := c.Param("id")
+	ps := c.QueryParam("page")
+	if ps == "" {
+		ps = "1"
+	}
+	page, err := strconv.Atoi(ps)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, fmt.Sprintf("invalid page number: %s", ps))
+	}
+	if page < 1 {
+		page = 1
+	}
+	si := c.QueryParam("size")
+	if si == "" {
+		si = "25"
+	}
+	size, err := strconv.Atoi(si)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, fmt.Sprintf("invalid size: %s", ps))
+	}
+	if size < 1 {
+		size = 1
+	} else if size > 50 {
+		size = 50
+	}
+	_, err = s.ds.GetTaskByID(c.Request().Context(), id)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, err.Error())
+	}
+	l, err := s.ds.GetTaskLogParts(c.Request().Context(), id, page, size)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusNotFound, err.Error())
+	}
+	return c.JSON(http.StatusOK, l)
+}
+
 func (s *API) getMetrics(c echo.Context) error {
 	metrics, err := s.ds.GetMetrics(c.Request().Context())
 	if err != nil {
@@ -444,7 +491,7 @@ func (s *API) cancelJob(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound, err.Error())
 	}
-	if j.State != tork.JobStateRunning {
+	if j.State != tork.JobStateRunning && j.State != tork.JobStateScheduled {
 		return echo.NewHTTPError(http.StatusBadRequest, "job is not running")
 	}
 	j.State = tork.JobStateCancelled

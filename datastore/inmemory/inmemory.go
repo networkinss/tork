@@ -1,8 +1,9 @@
-package datastore
+package inmemory
 
 import (
 	"context"
 	"strings"
+	"sync"
 
 	"sort"
 	"time"
@@ -10,14 +11,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/runabol/tork"
 
+	"github.com/runabol/tork/datastore"
 	"github.com/runabol/tork/internal/cache"
-)
-
-var (
-	ErrTaskNotFound    = errors.New("task not found")
-	ErrNodeNotFound    = errors.New("node not found")
-	ErrJobNotFound     = errors.New("job not found")
-	ErrContextNotFound = errors.New("context not found")
 )
 
 const (
@@ -30,6 +25,8 @@ type InMemoryDatastore struct {
 	tasks           *cache.Cache[*tork.Task]
 	nodes           *cache.Cache[*tork.Node]
 	jobs            *cache.Cache[*tork.Job]
+	logs            *cache.Cache[[]*tork.TaskLogPart]
+	logsMu          sync.RWMutex
 	nodeExpiration  *time.Duration
 	jobExpiration   *time.Duration
 	cleanupInterval *time.Duration
@@ -70,6 +67,7 @@ func NewInMemoryDatastore(opts ...Option) *InMemoryDatastore {
 	}
 	ds.nodes = cache.New[*tork.Node](nodeExp, ci)
 	ds.jobs = cache.New[*tork.Job](cache.NoExpiration, ci)
+	ds.logs = cache.New[[]*tork.TaskLogPart](cache.NoExpiration, ci)
 	ds.jobs.OnEvicted(ds.onJobEviction)
 	return ds
 }
@@ -85,7 +83,7 @@ func (ds *InMemoryDatastore) CreateTask(ctx context.Context, t *tork.Task) error
 func (ds *InMemoryDatastore) GetTaskByID(ctx context.Context, id string) (*tork.Task, error) {
 	t, ok := ds.tasks.Get(id)
 	if !ok {
-		return nil, ErrTaskNotFound
+		return nil, datastore.ErrTaskNotFound
 	}
 	return t.Clone(), nil
 }
@@ -93,7 +91,7 @@ func (ds *InMemoryDatastore) GetTaskByID(ctx context.Context, id string) (*tork.
 func (ds *InMemoryDatastore) UpdateTask(ctx context.Context, id string, modify func(u *tork.Task) error) error {
 	_, ok := ds.tasks.Get(id)
 	if !ok {
-		return ErrTaskNotFound
+		return datastore.ErrTaskNotFound
 	}
 	return ds.tasks.Modify(id, func(t *tork.Task) (*tork.Task, error) {
 		update := t.Clone()
@@ -116,7 +114,7 @@ func (ds *InMemoryDatastore) CreateNode(ctx context.Context, n *tork.Node) error
 func (ds *InMemoryDatastore) UpdateNode(ctx context.Context, id string, modify func(u *tork.Node) error) error {
 	_, ok := ds.nodes.Get(id)
 	if !ok {
-		return ErrNodeNotFound
+		return datastore.ErrNodeNotFound
 	}
 	return ds.nodes.Modify(id, func(n *tork.Node) (*tork.Node, error) {
 		update := n.Clone()
@@ -130,7 +128,7 @@ func (ds *InMemoryDatastore) UpdateNode(ctx context.Context, id string, modify f
 func (ds *InMemoryDatastore) GetNodeByID(ctx context.Context, id string) (*tork.Node, error) {
 	n, ok := ds.nodes.Get(id)
 	if !ok {
-		return nil, ErrNodeNotFound
+		return nil, datastore.ErrNodeNotFound
 	}
 	return n.Clone(), nil
 }
@@ -162,7 +160,7 @@ func (ds *InMemoryDatastore) CreateJob(ctx context.Context, j *tork.Job) error {
 func (ds *InMemoryDatastore) UpdateJob(ctx context.Context, id string, modify func(u *tork.Job) error) error {
 	_, ok := ds.jobs.Get(id)
 	if !ok {
-		return ErrJobNotFound
+		return datastore.ErrJobNotFound
 	}
 
 	err := ds.jobs.Modify(id, func(j *tork.Job) (*tork.Job, error) {
@@ -179,7 +177,7 @@ func (ds *InMemoryDatastore) UpdateJob(ctx context.Context, id string, modify fu
 
 	j, ok := ds.jobs.Get(id)
 	if !ok {
-		return ErrJobNotFound
+		return datastore.ErrJobNotFound
 	}
 
 	if j.State == tork.JobStateCompleted || j.State == tork.JobStateFailed {
@@ -208,7 +206,7 @@ func (ds *InMemoryDatastore) getExecution(id string) []*tork.Task {
 func (ds *InMemoryDatastore) GetJobByID(ctx context.Context, id string) (*tork.Job, error) {
 	j, ok := ds.jobs.Get(id)
 	if !ok {
-		return nil, ErrJobNotFound
+		return nil, datastore.ErrJobNotFound
 	}
 	j = j.Clone()
 	execution := ds.getExecution(id)
@@ -218,8 +216,8 @@ func (ds *InMemoryDatastore) GetJobByID(ctx context.Context, id string) (*tork.J
 		if posi != posj {
 			return posi < posj
 		}
-		ci := execution[i].CreatedAt
-		cj := execution[j].CreatedAt
+		ci := execution[i].StartedAt
+		cj := execution[j].StartedAt
 		if ci == nil {
 			return true
 		}
@@ -242,7 +240,7 @@ func (ds *InMemoryDatastore) GetActiveTasks(ctx context.Context, jobID string) (
 	return result, nil
 }
 
-func (ds *InMemoryDatastore) GetJobs(ctx context.Context, q string, page, size int) (*Page[*tork.JobSummary], error) {
+func (ds *InMemoryDatastore) GetJobs(ctx context.Context, q string, page, size int) (*datastore.Page[*tork.JobSummary], error) {
 	offset := (page - 1) * size
 	filtered := make([]*tork.Job, 0)
 	ds.jobs.Iterate(func(_ string, j *tork.Job) {
@@ -263,12 +261,69 @@ func (ds *InMemoryDatastore) GetJobs(ctx context.Context, q string, page, size i
 	if len(filtered)%size != 0 {
 		totalPages = totalPages + 1
 	}
-	return &Page[*tork.JobSummary]{
+	return &datastore.Page[*tork.JobSummary]{
 		Items:      result,
 		Number:     page,
 		Size:       len(result),
 		TotalPages: totalPages,
 		TotalItems: len(filtered),
+	}, nil
+}
+
+func (ds *InMemoryDatastore) CreateTaskLogPart(ctx context.Context, p *tork.TaskLogPart) error {
+	if p.TaskID == "" {
+		return errors.Errorf("must provide task id")
+	}
+	if p.Number < 1 {
+		return errors.Errorf("part number must be > 0")
+	}
+	now := time.Now().UTC()
+	p.CreatedAt = &now
+	ds.logsMu.Lock()
+	defer ds.logsMu.Unlock()
+	logs, ok := ds.logs.Get(p.TaskID)
+	if !ok {
+		logs = make([]*tork.TaskLogPart, 0)
+	}
+	logs = append(logs, p)
+	ds.logs.Set(p.TaskID, logs)
+	return nil
+}
+
+func (ds *InMemoryDatastore) GetTaskLogParts(ctx context.Context, taskID string, page, size int) (*datastore.Page[*tork.TaskLogPart], error) {
+	_, err := ds.GetTaskByID(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	parts, ok := ds.logs.Get(taskID)
+	if !ok {
+		return &datastore.Page[*tork.TaskLogPart]{
+			Items:      make([]*tork.TaskLogPart, 0),
+			Number:     1,
+			Size:       0,
+			TotalPages: 0,
+			TotalItems: 0,
+		}, nil
+	}
+	sort.Slice(parts, func(i, j int) bool {
+		return parts[i].Number > parts[j].Number
+	})
+	offset := (page - 1) * size
+	result := make([]*tork.TaskLogPart, 0)
+	for i := offset; i < (offset+size) && i < len(parts); i++ {
+		p := parts[i]
+		result = append(result, p)
+	}
+	totalPages := len(parts) / size
+	if len(parts)%size != 0 {
+		totalPages = totalPages + 1
+	}
+	return &datastore.Page[*tork.TaskLogPart]{
+		Items:      result,
+		Number:     page,
+		Size:       len(result),
+		TotalPages: totalPages,
+		TotalItems: len(parts),
 	}, nil
 }
 
@@ -301,7 +356,7 @@ func (ds *InMemoryDatastore) GetMetrics(ctx context.Context) (*tork.Metrics, err
 	return s, nil
 }
 
-func (ds *InMemoryDatastore) WithTx(ctx context.Context, f func(tx Datastore) error) error {
+func (ds *InMemoryDatastore) WithTx(ctx context.Context, f func(tx datastore.Datastore) error) error {
 	return f(ds)
 }
 

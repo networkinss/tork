@@ -6,26 +6,29 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
 	"os"
-	"strings"
 	"time"
-	"unicode"
 
+	cliopts "github.com/docker/cli/opts"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	regtypes "github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-units"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 	"github.com/runabol/tork"
+	"github.com/runabol/tork/internal/logging"
 	"github.com/runabol/tork/internal/syncx"
 	"github.com/runabol/tork/internal/uuid"
+	"github.com/runabol/tork/mq"
 	"github.com/runabol/tork/runtime"
 )
 
@@ -35,14 +38,17 @@ type DockerRuntime struct {
 	images  *syncx.Map[string, bool]
 	pullq   chan *pullRequest
 	mounter runtime.Mounter
+	broker  mq.Broker
+	config  string
 }
 
-type printableReader struct {
+type dockerLogsReader struct {
 	reader io.Reader
 }
 
 type pullRequest struct {
 	image    string
+	logger   io.Writer
 	registry registry
 	done     chan error
 }
@@ -57,6 +63,18 @@ type Option = func(rt *DockerRuntime)
 func WithMounter(mounter runtime.Mounter) Option {
 	return func(rt *DockerRuntime) {
 		rt.mounter = mounter
+	}
+}
+
+func WithBroker(broker mq.Broker) Option {
+	return func(rt *DockerRuntime) {
+		rt.broker = broker
+	}
+}
+
+func WithConfig(config string) Option {
+	return func(rt *DockerRuntime) {
+		rt.config = config
 	}
 }
 
@@ -104,18 +122,27 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 		}(mnt)
 		t.Mounts[i] = mnt
 	}
+	var logger io.Writer
+	if d.broker != nil {
+		logger = &logging.Forwarder{
+			Broker: d.broker,
+			TaskID: t.ID,
+		}
+	} else {
+		logger = os.Stdout
+	}
 	// excute pre-tasks
 	for _, pre := range t.Pre {
 		pre.ID = uuid.NewUUID()
 		pre.Mounts = t.Mounts
 		pre.Networks = t.Networks
 		pre.Limits = t.Limits
-		if err := d.doRun(ctx, pre); err != nil {
+		if err := d.doRun(ctx, pre, logger); err != nil {
 			return err
 		}
 	}
 	// run the actual task
-	if err := d.doRun(ctx, t); err != nil {
+	if err := d.doRun(ctx, t, logger); err != nil {
 		return err
 	}
 	// execute post tasks
@@ -124,18 +151,18 @@ func (d *DockerRuntime) Run(ctx context.Context, t *tork.Task) error {
 		post.Mounts = t.Mounts
 		post.Networks = t.Networks
 		post.Limits = t.Limits
-		if err := d.doRun(ctx, post); err != nil {
+		if err := d.doRun(ctx, post, logger); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (d *DockerRuntime) doRun(ctx context.Context, t *tork.Task) error {
+func (d *DockerRuntime) doRun(ctx context.Context, t *tork.Task, logger io.Writer) error {
 	if t.ID == "" {
 		return errors.New("task id is required")
 	}
-	if err := d.imagePull(ctx, t); err != nil {
+	if err := d.imagePull(ctx, t, logger); err != nil {
 		return errors.Wrapf(err, "error pulling image: %s", t.Image)
 	}
 
@@ -163,6 +190,8 @@ func (d *DockerRuntime) doRun(ctx context.Context, t *tork.Task) error {
 			if m.Source == "" {
 				return errors.Errorf("bind source is required")
 			}
+		case tork.MountTypeTmpfs:
+			mt = mount.TypeTmpfs
 		default:
 			return errors.Errorf("unknown mount type: %s", m.Type)
 		}
@@ -202,18 +231,28 @@ func (d *DockerRuntime) doRun(ctx context.Context, t *tork.Task) error {
 		return errors.Wrapf(err, "invalid memory value")
 	}
 
+	resources := container.Resources{
+		NanoCPUs: cpus,
+		Memory:   mem,
+	}
+
+	if t.GPUs != "" {
+		gpuOpts := cliopts.GpuOpts{}
+		if err := gpuOpts.Set(t.GPUs); err != nil {
+			return errors.Wrapf(err, "error setting GPUs")
+		}
+		resources.DeviceRequests = gpuOpts.Value()
+	}
+
 	hc := container.HostConfig{
 		PublishAllPorts: true,
 		Mounts:          mounts,
-		Resources: container.Resources{
-			NanoCPUs: cpus,
-			Memory:   mem,
-		},
+		Resources:       resources,
 	}
 
 	cmd := t.CMD
 	if len(cmd) == 0 {
-		cmd = []string{"./entrypoint"}
+		cmd = []string{fmt.Sprintf("%s/entrypoint", workdir.Target)}
 	}
 	entrypoint := t.Entrypoint
 	if len(entrypoint) == 0 && t.Run != "" {
@@ -224,7 +263,12 @@ func (d *DockerRuntime) doRun(ctx context.Context, t *tork.Task) error {
 		Env:        env,
 		Cmd:        cmd,
 		Entrypoint: entrypoint,
-		WorkingDir: workdir.Target,
+	}
+	// we want to override the default
+	// image WORKDIR only if the task
+	// introduces work files
+	if len(t.Files) > 0 {
+		cc.WorkingDir = workdir.Target
 	}
 
 	nc := network.NetworkingConfig{
@@ -235,8 +279,15 @@ func (d *DockerRuntime) doRun(ctx context.Context, t *tork.Task) error {
 		nc.EndpointsConfig[nw] = &network.EndpointSettings{NetworkID: nw}
 	}
 
+	// we want to create the container using a background context
+	// in case the task is being cancelled while the container is
+	// being created. This could lead to a situation where the
+	// container is created in a "zombie" state leading to a situation
+	// where the attached volumes can't be removed and cleaned up.
+	createCtx, createCancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer createCancel()
 	resp, err := d.client.ContainerCreate(
-		ctx, &cc, &hc, &nc, nil, "")
+		createCtx, &cc, &hc, &nc, nil, "")
 	if err != nil {
 		log.Error().Msgf(
 			"Error creating container using image %s: %v\n",
@@ -244,6 +295,9 @@ func (d *DockerRuntime) doRun(ctx context.Context, t *tork.Task) error {
 		)
 		return err
 	}
+
+	// create a mapping between task id and container id
+	d.tasks.Set(t.ID, resp.ID)
 
 	log.Debug().Msgf("created container %s", resp.ID)
 
@@ -263,9 +317,6 @@ func (d *DockerRuntime) doRun(ctx context.Context, t *tork.Task) error {
 	if err := d.initWorkdir(ctx, resp.ID, t); err != nil {
 		return errors.Wrapf(err, "error initializing container")
 	}
-
-	// create a mapping between task id and container id
-	d.tasks.Set(t.ID, resp.ID)
 
 	// start the container
 	log.Debug().Msgf("Starting container %s", resp.ID)
@@ -292,7 +343,7 @@ func (d *DockerRuntime) doRun(ctx context.Context, t *tork.Task) error {
 			log.Error().Err(err).Msgf("error closing stdout on container %s", resp.ID)
 		}
 	}()
-	_, err = io.Copy(os.Stdout, out)
+	_, err = io.Copy(logger, dockerLogsReader{reader: out})
 	if err != nil {
 		return errors.Wrapf(err, "error reading the std out")
 	}
@@ -317,12 +368,11 @@ func (d *DockerRuntime) doRun(ctx context.Context, t *tork.Task) error {
 				log.Error().Err(err).Msg("error tailing the log")
 				return errors.Errorf("exit code %d", status.StatusCode)
 			}
-			bufout := new(strings.Builder)
-			_, err = io.Copy(bufout, printableReader{reader: out})
+			buf, err := io.ReadAll(dockerLogsReader{reader: out})
 			if err != nil {
 				log.Error().Err(err).Msg("error copying the output")
 			}
-			return errors.Errorf("exit code %d: %s", status.StatusCode, bufout.String())
+			return errors.Errorf("exit code %d: %s", status.StatusCode, string(buf))
 		} else {
 			stdout, err := d.readOutput(ctx, resp.ID)
 			if err != nil {
@@ -469,7 +519,7 @@ func (d *DockerRuntime) Stop(ctx context.Context, t *tork.Task) error {
 		return nil
 	}
 	d.tasks.Delete(t.ID)
-	log.Printf("Attempting to stop and remove container %v", containerID)
+	log.Debug().Msgf("Attempting to stop and remove container %v", containerID)
 	return d.client.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{
 		RemoveVolumes: true,
 		RemoveLinks:   false,
@@ -505,26 +555,27 @@ func parseMemory(limits *tork.TaskLimits) (int64, error) {
 	return units.RAMInBytes(limits.Memory)
 }
 
-func (r printableReader) Read(p []byte) (int, error) {
-	buf := make([]byte, len(p))
-	n, err := r.reader.Read(buf)
+func (r dockerLogsReader) Read(p []byte) (int, error) {
+	hdr := make([]byte, 8)
+	_, err := r.reader.Read(hdr)
 	if err != nil {
-		return n, err
-	}
-	j := 0
-	for i := 0; i < n; i++ {
-		if unicode.IsPrint(rune(buf[i])) {
-			p[j] = buf[i]
-			j++
+		if err != io.EOF {
+			return 0, err
 		}
 	}
-	if j == 0 {
-		return 0, io.EOF
+	count := binary.BigEndian.Uint32(hdr[4:8])
+	data := make([]byte, count)
+	_, err = r.reader.Read(data)
+	if err != nil {
+		if err != io.EOF {
+			return 0, err
+		}
 	}
-	return j, nil
+	n := copy(p, data)
+	return n, err
 }
 
-func (d *DockerRuntime) imagePull(ctx context.Context, t *tork.Task) error {
+func (d *DockerRuntime) imagePull(ctx context.Context, t *tork.Task, logger io.Writer) error {
 	_, ok := d.images.Get(t.Image)
 	if ok {
 		return nil
@@ -547,8 +598,9 @@ func (d *DockerRuntime) imagePull(ctx context.Context, t *tork.Task) error {
 		}
 	}
 	pr := &pullRequest{
-		image: t.Image,
-		done:  make(chan error),
+		image:  t.Image,
+		logger: logger,
+		done:   make(chan error),
 	}
 	if t.Registry != nil {
 		pr.registry = registry{
@@ -564,10 +616,31 @@ func (d *DockerRuntime) imagePull(ctx context.Context, t *tork.Task) error {
 // to pull images from the docker repo
 func (d *DockerRuntime) puller(ctx context.Context) {
 	for pr := range d.pullq {
-		authConfig := types.AuthConfig{
-			Username: pr.registry.username,
-			Password: pr.registry.password,
+		var authConfig regtypes.AuthConfig
+		if pr.registry.username != "" {
+			authConfig = regtypes.AuthConfig{
+				Username: pr.registry.username,
+				Password: pr.registry.password,
+			}
+		} else {
+			ref, err := parseRef(pr.image)
+			if err != nil {
+				pr.done <- err
+				continue
+			}
+			if ref.domain != "" {
+				username, password, err := getRegistryCredentials(d.config, ref.domain)
+				if err != nil {
+					pr.done <- err
+					continue
+				}
+				authConfig = regtypes.AuthConfig{
+					Username: username,
+					Password: password,
+				}
+			}
 		}
+
 		encodedJSON, err := json.Marshal(authConfig)
 		if err != nil {
 			pr.done <- err
@@ -580,7 +653,7 @@ func (d *DockerRuntime) puller(ctx context.Context) {
 			pr.done <- err
 			continue
 		}
-		_, err = io.Copy(os.Stdout, reader)
+		_, err = io.Copy(pr.logger, reader)
 		if err != nil {
 			pr.done <- err
 			continue

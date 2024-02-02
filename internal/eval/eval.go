@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"regexp"
 
-	"github.com/antonmedv/expr"
+	"github.com/expr-lang/expr"
 	"github.com/pkg/errors"
 	"github.com/runabol/tork"
 )
@@ -81,6 +81,50 @@ func EvaluateTask(t *tork.Task, c map[string]any) error {
 			parallel[i] = par
 		}
 		t.Parallel.Tasks = parallel
+	}
+	// evaluate cmd
+	cmd := t.CMD
+	for i, v := range cmd {
+		result, err := EvaluateTemplate(v, c)
+		if err != nil {
+			return err
+		}
+		cmd[i] = result
+	}
+	// evaluate sub-job
+	if t.SubJob != nil {
+		name, err := EvaluateTemplate(t.SubJob.Name, c)
+		if err != nil {
+			return err
+		}
+		t.SubJob.Name = name
+		if t.SubJob.Inputs == nil {
+			t.SubJob.Inputs = make(map[string]string)
+		}
+		for k, v := range t.SubJob.Inputs {
+			result, err := EvaluateTemplate(v, c)
+			if err != nil {
+				return err
+			}
+			t.SubJob.Inputs[k] = result
+		}
+		for _, wh := range t.SubJob.Webhooks {
+			url, err := EvaluateTemplate(wh.URL, c)
+			if err != nil {
+				return err
+			}
+			wh.URL = url
+			if wh.Headers == nil {
+				wh.Headers = make(map[string]string)
+			}
+			for k, v := range wh.Headers {
+				result, err := EvaluateTemplate(v, c)
+				if err != nil {
+					return err
+				}
+				wh.Headers[k] = result
+			}
+		}
 	}
 	return nil
 }

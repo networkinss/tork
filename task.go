@@ -58,6 +58,32 @@ type Task struct {
 	Parallel    *ParallelTask     `json:"parallel,omitempty"`
 	Each        *EachTask         `json:"each,omitempty"`
 	SubJob      *SubJobTask       `json:"subjob,omitempty"`
+	GPUs        string            `json:"gpus,omitempty"`
+	Tags        []string          `json:"tags,omitempty"`
+}
+
+type TaskSummary struct {
+	ID          string     `json:"id,omitempty"`
+	JobID       string     `json:"jobId,omitempty"`
+	Position    int        `json:"position,omitempty"`
+	Name        string     `json:"name,omitempty"`
+	Description string     `json:"description,omitempty"`
+	State       TaskState  `json:"state,omitempty"`
+	CreatedAt   *time.Time `json:"createdAt,omitempty"`
+	ScheduledAt *time.Time `json:"scheduledAt,omitempty"`
+	StartedAt   *time.Time `json:"startedAt,omitempty"`
+	CompletedAt *time.Time `json:"completedAt,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	Result      string     `json:"result,omitempty"`
+	Var         string     `json:"var,omitempty"`
+	Tags        []string   `json:"tags,omitempty"`
+}
+
+type TaskLogPart struct {
+	Number    int        `json:"number,omitempty"`
+	TaskID    string     `json:"taskId,omitempty"`
+	Contents  string     `json:"contents,omitempty"`
+	CreatedAt *time.Time `json:"createdAt,omitempty"`
 }
 
 type SubJobTask struct {
@@ -67,6 +93,8 @@ type SubJobTask struct {
 	Tasks       []*Task           `json:"tasks,omitempty"`
 	Inputs      map[string]string `json:"inputs,omitempty"`
 	Output      string            `json:"output,omitempty"`
+	Detached    bool              `json:"detached,omitempty"`
+	Webhooks    []*Webhook        `json:"webhooks,omitempty"`
 }
 
 type ParallelTask struct {
@@ -75,6 +103,7 @@ type ParallelTask struct {
 }
 
 type EachTask struct {
+	Var         string `json:"var,omitempty"`
 	List        string `json:"list,omitempty"`
 	Task        *Task  `json:"task,omitempty"`
 	Size        int    `json:"size,omitempty"`
@@ -163,6 +192,8 @@ func (t *Task) Clone() *Task {
 		Each:        each,
 		Description: t.Description,
 		SubJob:      subjob,
+		GPUs:        t.GPUs,
+		Tags:        t.Tags,
 	}
 }
 
@@ -190,6 +221,7 @@ func (l *TaskLimits) Clone() *TaskLimits {
 
 func (e *EachTask) Clone() *EachTask {
 	return &EachTask{
+		Var:         e.Var,
 		List:        e.List,
 		Task:        e.Task.Clone(),
 		Size:        e.Size,
@@ -205,6 +237,8 @@ func (s *SubJobTask) Clone() *SubJobTask {
 		Inputs:      maps.Clone(s.Inputs),
 		Tasks:       CloneTasks(s.Tasks),
 		Output:      s.Output,
+		Detached:    s.Detached,
+		Webhooks:    CloneWebhooks(s.Webhooks),
 	}
 }
 
@@ -219,5 +253,24 @@ func (r *Registry) Clone() *Registry {
 	return &Registry{
 		Username: r.Username,
 		Password: r.Password,
+	}
+}
+
+func NewTaskSummary(t *Task) *TaskSummary {
+	return &TaskSummary{
+		ID:          t.ID,
+		JobID:       t.JobID,
+		Position:    t.Position,
+		Name:        t.Name,
+		Description: t.Description,
+		State:       t.State,
+		CreatedAt:   t.CreatedAt,
+		ScheduledAt: t.ScheduledAt,
+		StartedAt:   t.StartedAt,
+		CompletedAt: t.CompletedAt,
+		Error:       t.Error,
+		Result:      t.Result,
+		Var:         t.Var,
+		Tags:        t.Tags,
 	}
 }

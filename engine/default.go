@@ -53,8 +53,12 @@ func RegisterEndpoint(method, path string, handler web.HandlerFunc) {
 	defaultEngine.RegisterEndpoint(method, path, handler)
 }
 
-func SubmitJob(ctx context.Context, ij *input.Job, listeners ...web.JobListener) (*tork.Job, error) {
+func SubmitJob(ctx context.Context, ij *input.Job, listeners ...JobListener) (*tork.Job, error) {
 	return defaultEngine.SubmitJob(ctx, ij, listeners...)
+}
+
+func OnBrokerInit(fn func(b mq.Broker) error) {
+	defaultEngine.OnBrokerInit(fn)
 }
 
 func Start() error {

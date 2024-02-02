@@ -2,13 +2,17 @@ package docker
 
 import (
 	"context"
+	"os"
+	"path"
+	"sync"
 	"testing"
 
 	"github.com/runabol/tork"
+	"github.com/runabol/tork/internal/uuid"
 	"github.com/stretchr/testify/assert"
 )
 
-func Test_createMountBindNotAllowed(t *testing.T) {
+func TestMountBindNotAllowed(t *testing.T) {
 	m := &BindMounter{cfg: BindConfig{
 		Allowed: false,
 	}}
@@ -21,36 +25,24 @@ func Test_createMountBindNotAllowed(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func Test_createMountBindDenylist(t *testing.T) {
-	m := &BindMounter{cfg: BindConfig{
-		Allowed:  true,
-		Denylist: []string{"/tmp"},
-	}}
-	err := m.Mount(context.Background(), &tork.Mount{
-		Type:   tork.MountTypeBind,
-		Source: "/tmp",
-		Target: "/somevol",
+func TestMountCreate(t *testing.T) {
+	m := NewBindMounter(BindConfig{
+		Allowed: true,
 	})
-	assert.Error(t, err)
-}
-
-func Test_createMountBindAllowlist(t *testing.T) {
-	m := &BindMounter{cfg: BindConfig{
-		Allowed:   true,
-		Allowlist: []string{"/tmp"},
-	}}
-	mnt := tork.Mount{
-		Type:   tork.MountTypeBind,
-		Source: "/tmp",
-		Target: "/somevol",
+	dir := path.Join(os.TempDir(), uuid.NewUUID())
+	wg := sync.WaitGroup{}
+	c := 10
+	wg.Add(c)
+	for i := 0; i < c; i++ {
+		go func() {
+			defer wg.Done()
+			err := m.Mount(context.Background(), &tork.Mount{
+				Type:   tork.MountTypeBind,
+				Source: dir,
+				Target: "/somevol",
+			})
+			assert.NoError(t, err)
+		}()
 	}
-
-	err := m.Mount(context.Background(), &mnt)
-	assert.NoError(t, err)
-	defer func() {
-		assert.NoError(t, m.Unmount(context.Background(), &mnt))
-	}()
-	assert.Equal(t, "/somevol", mnt.Target)
-	assert.Equal(t, "/tmp", mnt.Source)
-	assert.Equal(t, tork.MountTypeBind, mnt.Type)
+	wg.Wait()
 }

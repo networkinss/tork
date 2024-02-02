@@ -1,4 +1,4 @@
-package datastore_test
+package inmemory_test
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 
 	"github.com/runabol/tork"
 	"github.com/runabol/tork/datastore"
+	"github.com/runabol/tork/datastore/inmemory"
 
 	"github.com/runabol/tork/internal/uuid"
 	"github.com/stretchr/testify/assert"
@@ -17,7 +18,7 @@ import (
 
 func TestInMemoryCreateAndGetTask(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
+	ds := inmemory.NewInMemoryDatastore()
 	t1 := tork.Task{
 		ID: uuid.NewUUID(),
 	}
@@ -30,7 +31,7 @@ func TestInMemoryCreateAndGetTask(t *testing.T) {
 
 func TestInMemoryGetActiveTasks(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
+	ds := inmemory.NewInMemoryDatastore()
 	jid := uuid.NewUUID()
 
 	tasks := []tork.Task{{
@@ -70,7 +71,7 @@ func TestInMemoryGetActiveTasks(t *testing.T) {
 
 func TestInMemoryUpdateTask(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
+	ds := inmemory.NewInMemoryDatastore()
 	t1 := tork.Task{
 		ID:    uuid.NewUUID(),
 		State: tork.TaskStatePending,
@@ -91,7 +92,7 @@ func TestInMemoryUpdateTask(t *testing.T) {
 
 func TestInMemoryUpdateTaskConcurrently(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
+	ds := inmemory.NewInMemoryDatastore()
 
 	now := time.Now().UTC()
 	j1 := tork.Job{
@@ -150,7 +151,7 @@ func TestInMemoryUpdateTaskConcurrently(t *testing.T) {
 
 func TestInMemoryUpdateJobConcurrently(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
+	ds := inmemory.NewInMemoryDatastore()
 
 	j1 := tork.Job{
 		ID:        uuid.NewUUID(),
@@ -199,7 +200,7 @@ func TestInMemoryUpdateJobConcurrently(t *testing.T) {
 
 func TestInMemoryCreateAndGetNode(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
+	ds := inmemory.NewInMemoryDatastore()
 	n1 := &tork.Node{
 		ID: uuid.NewUUID(),
 	}
@@ -212,7 +213,7 @@ func TestInMemoryCreateAndGetNode(t *testing.T) {
 
 func TestInMemoryUpdateNode(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
+	ds := inmemory.NewInMemoryDatastore()
 	n1 := &tork.Node{
 		ID:              uuid.NewUUID(),
 		LastHeartbeatAt: time.Now().UTC().Add(-time.Minute),
@@ -235,7 +236,7 @@ func TestInMemoryUpdateNode(t *testing.T) {
 
 func TestInMemoryUpdateNodeConcurrently(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore()
+	ds := inmemory.NewInMemoryDatastore()
 	n1 := &tork.Node{
 		ID:              uuid.NewUUID(),
 		LastHeartbeatAt: time.Now().UTC().Add(-time.Minute),
@@ -279,9 +280,9 @@ func TestInMemoryUpdateNodeConcurrently(t *testing.T) {
 
 func TestInMemoryExpiredNodes(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore(
-		datastore.WithCleanupInterval(time.Millisecond*20),
-		datastore.WithNodeExpiration(time.Millisecond*10),
+	ds := inmemory.NewInMemoryDatastore(
+		inmemory.WithCleanupInterval(time.Millisecond*20),
+		inmemory.WithNodeExpiration(time.Millisecond*10),
 	)
 	n := &tork.Node{
 		ID: uuid.NewUUID(),
@@ -298,9 +299,9 @@ func TestInMemoryExpiredNodes(t *testing.T) {
 
 func TestInMemoryExpiredJob(t *testing.T) {
 	ctx := context.Background()
-	ds := datastore.NewInMemoryDatastore(
-		datastore.WithCleanupInterval(time.Millisecond*20),
-		datastore.WithJobExpiration(time.Millisecond*10),
+	ds := inmemory.NewInMemoryDatastore(
+		inmemory.WithCleanupInterval(time.Millisecond*20),
+		inmemory.WithJobExpiration(time.Millisecond*10),
 	)
 	j := &tork.Job{
 		ID:    uuid.NewUUID(),
@@ -354,4 +355,89 @@ func TestInMemoryExpiredJob(t *testing.T) {
 	_, err = ds.GetTaskByID(ctx, ta.ID)
 	assert.Error(t, err)
 	assert.ErrorIs(t, err, datastore.ErrTaskNotFound)
+}
+
+func TestInMemoryCreateAndGetTaskLogs(t *testing.T) {
+	ctx := context.Background()
+	ds := inmemory.NewInMemoryDatastore()
+	t1 := tork.Task{
+		ID: uuid.NewUUID(),
+	}
+	err := ds.CreateTask(ctx, &t1)
+	assert.NoError(t, err)
+
+	err = ds.CreateTaskLogPart(ctx, &tork.TaskLogPart{
+		Number:   1,
+		TaskID:   t1.ID,
+		Contents: "line 1",
+	})
+	assert.NoError(t, err)
+
+	logs, err := ds.GetTaskLogParts(ctx, t1.ID, 1, 10)
+	assert.NoError(t, err)
+	assert.Len(t, logs.Items, 1)
+	assert.Equal(t, "line 1", logs.Items[0].Contents)
+	assert.Equal(t, 1, logs.TotalPages)
+}
+
+func TestInMemoryCreateAndGetTaskLogsMultiParts(t *testing.T) {
+	ctx := context.Background()
+	ds := inmemory.NewInMemoryDatastore()
+	t1 := tork.Task{
+		ID: uuid.NewUUID(),
+	}
+	err := ds.CreateTask(ctx, &t1)
+	assert.NoError(t, err)
+
+	parts := 10
+
+	wg := sync.WaitGroup{}
+	wg.Add(parts)
+
+	for i := 1; i <= parts; i++ {
+		go func(n int) {
+			defer wg.Done()
+			err := ds.CreateTaskLogPart(ctx, &tork.TaskLogPart{
+				Number:   n,
+				TaskID:   t1.ID,
+				Contents: fmt.Sprintf("line %d", n),
+			})
+			assert.NoError(t, err)
+		}(i)
+	}
+
+	wg.Wait()
+
+	logs, err := ds.GetTaskLogParts(ctx, t1.ID, 1, 10)
+	assert.NoError(t, err)
+	assert.Len(t, logs.Items, 10)
+	assert.Equal(t, "line 10", logs.Items[0].Contents)
+	assert.Equal(t, "line 1", logs.Items[9].Contents)
+}
+
+func TestInMemoryCreateAndGetTaskLogsLarge(t *testing.T) {
+	ctx := context.Background()
+	ds := inmemory.NewInMemoryDatastore()
+	t1 := tork.Task{
+		ID: uuid.NewUUID(),
+	}
+	err := ds.CreateTask(ctx, &t1)
+	assert.NoError(t, err)
+
+	for i := 1; i <= 100; i++ {
+		err = ds.CreateTaskLogPart(ctx, &tork.TaskLogPart{
+			Number:   i,
+			TaskID:   t1.ID,
+			Contents: fmt.Sprintf("line %d", i),
+		})
+		assert.NoError(t, err)
+	}
+
+	logs, err := ds.GetTaskLogParts(ctx, t1.ID, 1, 10)
+	assert.NoError(t, err)
+	assert.Len(t, logs.Items, 10)
+	assert.Equal(t, "line 100", logs.Items[0].Contents)
+	assert.Equal(t, "line 91", logs.Items[9].Contents)
+	assert.Equal(t, 10, logs.Size)
+	assert.Equal(t, 10, logs.TotalPages)
 }

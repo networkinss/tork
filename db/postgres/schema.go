@@ -3,6 +3,7 @@ package postgres
 const SCHEMA = `
 CREATE TABLE nodes (
     id                 varchar(32)  not null primary key,
+    name               varchar(64)  not null,
     queue              varchar(64)  not null,
     started_at         timestamp    not null,
     last_heartbeat_at  timestamp    not null,
@@ -33,7 +34,8 @@ CREATE TABLE jobs (
     output_       text,
     result        text,
     error_        text,
-    defaults      jsonb
+    defaults      jsonb,
+    webhooks      jsonb
 );
 
 CREATE INDEX idx_jobs_state ON jobs (state);
@@ -77,15 +79,29 @@ CREATE TABLE tasks (
     limits        jsonb,
     timeout       varchar(8),
     result        text,
-    var           varchar(16),
+    var           varchar(64),
     parallel      jsonb,
     parent_id     varchar(32),
     each_         jsonb,
     description   text,
     subjob        jsonb,
-    networks      text[]
+    networks      text[],
+    gpus          text,
+    if_           text,
+    tags          text[]
 );
 
 CREATE INDEX idx_tasks_state ON tasks (state);
 CREATE INDEX idx_tasks_job_id ON tasks (job_id);
+
+CREATE TABLE tasks_log_parts (
+    id         varchar(32) not null primary key,
+    number_    int         not null,
+    task_id    varchar(32) not null references tasks(id),
+    created_at timestamp   not null,
+    contents   text        not null
+);
+
+CREATE INDEX idx_tasks_log_parts_task_id ON tasks_log_parts (task_id);
+CREATE INDEX idx_tasks_log_parts_created_at ON tasks_log_parts (created_at);
 `

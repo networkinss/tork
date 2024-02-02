@@ -48,7 +48,9 @@ func TestRedactTask(t *testing.T) {
 		},
 	}
 
-	Task(&ta)
+	redacter := NewRedacter()
+
+	redacter.RedactTask(&ta)
 
 	assert.Equal(t, "[REDACTED]", ta.Env["secret_1"])
 	assert.Equal(t, "[REDACTED]", ta.Env["SecrET_2"])
@@ -103,9 +105,24 @@ func TestRedactJob(t *testing.T) {
 				"task2":  "helloworld",
 			},
 		},
+		Webhooks: []*tork.Webhook{
+			{
+				URL: "http://example.com/1",
+			},
+			{
+				URL: "http://example.com/2",
+				Headers: map[string]string{
+					"my-header": "my-value",
+					"my-secret": "secret",
+				},
+			},
+		},
 	}
 	j := o.Clone()
-	Job(j)
+
+	redacter := NewRedacter()
+	redacter.RedactJob(j)
+
 	assert.Equal(t, "[REDACTED]", j.Tasks[0].Env["secret_1"])
 	assert.Equal(t, "[REDACTED]", j.Tasks[0].Env["SecrET_2"])
 	assert.Equal(t, "[REDACTED]", j.Tasks[0].Env["PASSword"])
@@ -122,4 +139,52 @@ func TestRedactJob(t *testing.T) {
 		"task2":  "helloworld",
 	}, j.Context.Tasks)
 	assert.Equal(t, "[REDACTED]", j.Execution[0].Env["secret_1"])
+	assert.Equal(t, "http://example.com/1", j.Webhooks[0].URL)
+	assert.Equal(t, "http://example.com/2", j.Webhooks[1].URL)
+	assert.Equal(t, map[string]string{"my-header": "my-value", "my-secret": "[REDACTED]"}, j.Webhooks[1].Headers)
+}
+
+func TestRedactJobContains(t *testing.T) {
+	o := &tork.Job{
+		Tasks: []*tork.Task{
+			{
+				Env: map[string]string{
+					"secret_1": "secret",
+					"PASSword": "password",
+					"harmless": "hello world",
+				},
+			},
+		},
+	}
+	j := o.Clone()
+
+	redacter := NewRedacter(Contains("secret"))
+	redacter.RedactJob(j)
+
+	assert.Equal(t, "[REDACTED]", j.Tasks[0].Env["secret_1"])
+	assert.Equal(t, "password", j.Tasks[0].Env["PASSword"])
+	assert.Equal(t, "hello world", j.Tasks[0].Env["harmless"])
+}
+func TestRedactJobWildcard(t *testing.T) {
+	o := &tork.Job{
+		Tasks: []*tork.Task{
+			{
+				Env: map[string]string{
+					"secret_1":  "secret",
+					"_secret_2": "secret",
+					"PASSword":  "password",
+					"harmless":  "hello world",
+				},
+			},
+		},
+	}
+	j := o.Clone()
+
+	redacter := NewRedacter(Wildcard("secret*"))
+	redacter.RedactJob(j)
+
+	assert.Equal(t, "[REDACTED]", j.Tasks[0].Env["secret_1"])
+	assert.Equal(t, "secret", j.Tasks[0].Env["_secret_2"])
+	assert.Equal(t, "password", j.Tasks[0].Env["PASSword"])
+	assert.Equal(t, "hello world", j.Tasks[0].Env["harmless"])
 }

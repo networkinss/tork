@@ -9,6 +9,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/runabol/tork"
 	"github.com/runabol/tork/datastore"
+	"github.com/runabol/tork/datastore/inmemory"
 	"github.com/runabol/tork/input"
 	"github.com/runabol/tork/runtime/docker"
 	"github.com/runabol/tork/runtime/shell"
@@ -245,12 +246,33 @@ func TestRegisterDatastoreProvider(t *testing.T) {
 	assert.Equal(t, StateIdle, eng.state)
 
 	eng.RegisterDatastoreProvider("inmem2", func() (datastore.Datastore, error) {
-		return datastore.NewInMemoryDatastore(), nil
+		return inmemory.NewInMemoryDatastore(), nil
 	})
 
 	err := eng.Start()
 	assert.NoError(t, err)
 	assert.Equal(t, StateRunning, eng.state)
+
+	err = eng.Terminate()
+	assert.NoError(t, err)
+}
+
+func TestOnBrokerInit(t *testing.T) {
+	eng := New(Config{Mode: ModeStandalone})
+	assert.Equal(t, StateIdle, eng.state)
+
+	c := make(chan any)
+	eng.OnBrokerInit(func(b mq.Broker) error {
+		assert.NotNil(t, b)
+		close(c)
+		return nil
+	})
+
+	err := eng.Start()
+	assert.NoError(t, err)
+	assert.Equal(t, StateRunning, eng.state)
+
+	<-c
 
 	err = eng.Terminate()
 	assert.NoError(t, err)
